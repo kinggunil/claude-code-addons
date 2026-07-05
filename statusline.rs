@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05";
+const VERSION: &str = "26.07.05.2";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -362,6 +362,37 @@ fn home() -> PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Machine hostname, short form (domain stripped, e.g. "ip-10-0-1-23.ec2.internal"
+/// -> "ip-10-0-1-23"). gethostname(2) on unix, COMPUTERNAME on Windows — both
+/// zero-cost, no subprocess. Runs wherever the status line runs, so under SSH it
+/// reports the *remote* box you're working on.
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut u8, len: usize) -> i32;
+    }
+    let mut buf = [0u8; 256];
+    if unsafe { gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty());
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let full = String::from_utf8_lossy(&buf[..end]).into_owned();
+    full.split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+#[cfg(windows)]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty())
 }
 
 // -- cumulative (busy, total) CPU time since boot, per OS --
@@ -1155,6 +1186,17 @@ fn main() {
     for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
         if let Some(v) = val {
             parts.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
+        }
+    }
+    // host: which machine this session runs on. 🏠 dim = local, 🌐 orange = SSH
+    // remote (so an EC2 session is unmistakable). Short hostname; domain stripped.
+    if let Some(h) = hostname() {
+        let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_TTY").is_some();
+        if is_ssh {
+            parts.push(format!("{}🌐 {}{}", fg(214), h, RESET));
+        } else {
+            parts.push(format!("{}🏠 {}{}", C_DIM, h, RESET));
         }
     }
     // version last: far-right build tag for cross-machine update checks
