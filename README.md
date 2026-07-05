@@ -1,5 +1,7 @@
 # claude-code-addons
 
+**English** · [한국어](README.ko.md)
+
 Two zero-dependency **Rust** tools for [Claude Code](https://claude.com/claude-code),
 installed together by one command:
 
