@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.12";
+const VERSION: &str = "26.07.05.15";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -51,6 +51,7 @@ const C_ON: &str = "\x1b[38;5;42m"; // green
 const C_OFF: &str = "\x1b[38;5;244m"; // muted gray
 const C_DIR: &str = "\x1b[38;5;75m"; // blue
 const C_SEP: &str = "\x1b[38;5;238m"; // faint separator
+const C_HOST: &str = "\x1b[38;5;44m"; // cyan — local host (cool complement to SSH orange)
 const C_ERR: &str = "\x1b[38;5;196m"; // red
 
 fn fg(n: u16) -> String {
@@ -820,7 +821,8 @@ fn rate_limit_segment(label: &str, pct: f64, resets_at: Option<f64>, now: Option
     if let (Some(r), Some(n)) = (resets_at, now) {
         if r > n {
             if let Some(rem) = fmt_duration((r - n) * 1000.0) {
-                seg.push_str(&format!(" {}({}){}", C_OFF, rem, RESET));
+                // ⏳ marks the reset countdown, matching the 7d segment
+                seg.push_str(&format!(" {}⏳{}{}", C_OFF, rem, RESET));
             }
         }
     }
@@ -902,14 +904,6 @@ fn pace_color(delta: f64) -> String {
     })
 }
 
-/// Signed percentage-point delta, whole number, explicit sign: "-3%", "+34%",
-/// "+0%" (folds -0.0 so it never prints "-0%").
-fn signed_pp(delta: f64) -> String {
-    let r = delta.round();
-    let r = if r == 0.0 { 0.0 } else { r };
-    format!("{:+.0}%", r)
-}
-
 /// Time-equivalent of a pace delta (percentage points). Usage maps linearly to
 /// the week, so 1pp == WEEK_SECS/100 of schedule time: at +5pp you've consumed
 /// what an on-pace user reaches 5% of a week — ~8h24m — later, i.e. you're that
@@ -923,12 +917,13 @@ fn pace_time(delta: f64) -> Option<String> {
     fmt_span_compact(r.abs() / 100.0 * WEEK_SECS)
 }
 
-/// Line-1 weekly segment. With usage, "used/elapsed%" and the signed delta —
-/// annotated with the delta re-expressed as time (how far ahead of / behind the
-/// clock the usage is) — are colored by headroom (used - elapsed); without
-/// rate-limit data, just the week time-progress so the segment still renders.
-///   with usage: "7d 13/8% (+5% 8h24m) (6d 10h)"   (used 13%, 8% of week gone → 8h24m ahead of pace)
-///   time only:  "wk 8% ⏳ (6d 10h)"
+/// Line-1 weekly segment, written in plain language so it reads without a legend.
+/// With usage: "N% used", then the pace as words ("N% over pace" burning fast /
+/// "N% under pace" headroom / "on pace"), annotated with that same gap re-expressed
+/// as time in parens, colored by headroom (used - elapsed); then the reset countdown
+/// behind an ⏳. Without rate-limit data, just the week time-progress.
+///   with usage: "7d 39% used · 18% over pace (1d6h) · ⏳5d12h"
+///   time only:  "wk 21% · ⏳5d12h"
 fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64) -> String {
     let elapsed = week_elapsed_secs(resets_at, now);
     let elapsed_pct = clip(elapsed / WEEK_SECS * 100.0);
@@ -938,25 +933,24 @@ fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64) -> String
         let u = clip(u);
         let delta = u - elapsed_pct;
         let col = pace_color(delta);
-        let pace = pace_time(delta)
-            .map(|t| format!(" {}", t))
+        let d = delta.round() as i64;
+        // the same gap re-expressed as time, in parens right after the words
+        let t = pace_time(delta)
+            .map(|t| format!(" ({})", t))
             .unwrap_or_default();
-        format!(
-            "7d {}{:.0}/{:.0}%{} {}({}{}){}",
-            col,
-            u,
-            elapsed_pct,
-            RESET,
-            col,
-            signed_pp(delta),
-            pace,
-            RESET,
-        )
+        let pace = if d > 0 {
+            format!("{}{}% over pace{}{}", col, d, t, RESET)
+        } else if d < 0 {
+            format!("{}{}% under pace{}{}", col, -d, t, RESET)
+        } else {
+            format!("{}on pace{}", col, RESET)
+        };
+        format!("7d {:.0}% used {}·{} {}", u, C_SEP, RESET, pace)
     } else {
-        format!("{}wk {}%{} ⏳", C_OFF, fmt_pct(elapsed_pct), RESET)
+        format!("{}wk {}%{}", C_OFF, fmt_pct(elapsed_pct), RESET)
     };
     if let Some(c) = countdown {
-        seg.push_str(&format!(" {}({}){}", C_OFF, c, RESET));
+        seg.push_str(&format!(" {}·{} {}⏳{}{}", C_SEP, RESET, C_OFF, c, RESET));
     }
     seg
 }
@@ -1214,7 +1208,7 @@ fn main() {
         if is_ssh {
             machine.push(format!("{}🌐 {}{}", fg(214), h, RESET));
         } else {
-            machine.push(format!("{}🏠 {}{}", C_DIM, h, RESET));
+            machine.push(format!("{}🏠 {}{}", C_HOST, h, RESET));
         }
     }
     if !machine.is_empty() {
@@ -1359,7 +1353,7 @@ mod tests {
         let s = rate_limit_segment("7d", 41.0, None, None);
         assert!(s.contains("7d"));
         assert!(s.contains("41%"));
-        assert!(!s.contains('(')); // no countdown when resets_at/now missing
+        assert!(!s.contains('⏳')); // no countdown when resets_at/now missing
     }
 
     #[test]
@@ -1420,14 +1414,6 @@ mod tests {
     }
 
     #[test]
-    fn signed_pp_formats_sign() {
-        assert_eq!(signed_pp(-3.0), "-3%");
-        assert_eq!(signed_pp(34.2), "+34%");
-        assert_eq!(signed_pp(0.0), "+0%");
-        assert_eq!(signed_pp(-0.2), "+0%"); // never "-0%"
-    }
-
-    #[test]
     fn pace_color_tracks_headroom() {
         assert_eq!(pace_color(-30.0), fg(42)); // deep headroom -> green
         assert_eq!(pace_color(0.0), fg(220)); // on pace -> yellow
@@ -1474,13 +1460,14 @@ mod tests {
 
     #[test]
     fn weekly_segment_with_and_without_usage() {
-        // used 12%, resets in 6 days -> ~1 day elapsed -> "12/14%" fraction,
-        // delta -2% -> ~3h21m of headroom shown alongside the sign
+        // used 12%, resets in 6 days -> ~1 day (~14%) of the week elapsed ->
+        // "12% used", 2% under pace, that gap re-expressed as ~3h21m of headroom
         let s = weekly_segment(Some(12.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0);
         assert!(s.contains("7d"));
-        assert!(s.contains("12/"));
-        assert!(s.contains("-2%"));
-        assert!(s.contains("3h21m")); // delta re-expressed as time
+        assert!(s.contains("12% used"));
+        assert!(s.contains("2% under pace"));
+        assert!(s.contains("3h21m")); // gap re-expressed as time
+        assert!(s.contains('⏳')); // reset countdown marker
         assert!(!s.contains("wk")); // usage mode has no wk label
         let t = weekly_segment(None, None, WEEK_ANCHOR + 86_400.0);
         assert!(t.contains("wk"));

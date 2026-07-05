@@ -53,7 +53,7 @@ Two lines under the prompt, split by domain — your **Claude session** on top,
 **this machine** below:
 
 ```
-Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% (3h 54m) | 7d 23/18% (+5% 8h24m) (5d 17h) | 4h 31m · $2.74
+Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% ⏳3h 54m | 7d 23% used · 5% over pace (8h24m) · ⏳5d 17h | 4h 31m · $2.74
 CPU 10% · RAM 56% · VM 62% · 🏠 my-mac | mydir | v26.07.05 | claude --resume <sid>
 ```
 
@@ -65,12 +65,13 @@ CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude -
 ```
 
 - **Line 1 — Claude session**: model, effort, thinking toggle, context gauge,
-  then Claude.ai rate-limit usage (Pro/Max). The 7-day window is a **weekly pace**
-  gauge: `used% / week-elapsed%` plus how far ahead of / behind the linear
-  "on-pace" line you are, colored by headroom, with a countdown to the
-  Saturday-04:00-KST reset; then elapsed time and cost.
+  then Claude.ai rate-limit usage (Pro/Max) — each window as `used%` plus a reset
+  countdown behind an ⏳. The 7-day window adds a **weekly pace** in plain words:
+  `N% over pace` (burning faster than the even Saturday-04:00-KST reset line) or
+  `N% under pace` (headroom), colored by how much slack you have and annotated
+  with that gap re-expressed as time; then elapsed time and cost.
 - **Line 2 — this machine**: CPU/RAM/VM first (the only live-changing values, so
-  they get the leftmost first-read spot), then the machine **host** (🏠 dim =
+  they get the leftmost first-read spot), then the machine **host** (🏠 cyan =
   local, 🌐 orange = SSH remote — the hostname comes from wherever the status line
   runs, so under SSH it names the remote box), the working dir, a `vYY.MM.DD`
   build tag (compare it against the repo to spot stale machines), and the full
