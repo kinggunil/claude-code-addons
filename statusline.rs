@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.11";
+const VERSION: &str = "26.07.05.12";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -1033,9 +1033,24 @@ fn main() {
         max_ctx.to_string()
     };
 
-    // primary: last message's usage from the transcript tail (bounded, accurate)
+    // primary: harness-provided token count — no file I/O, always current. Accepted
+    // only when it fits the window (this field can occasionally report a bogus,
+    // out-of-range value, which is why it stays guarded). The percent is still
+    // derived from this raw count below, so decimal precision is preserved (we do
+    // NOT use the pre-rounded integer `used_percentage`).
     let mut ctx_tokens: u64 = 0;
-    if !transcript.is_empty() {
+    if let Some(v) = cw
+        .and_then(|c| c.get("total_input_tokens"))
+        .and_then(Json::as_f64)
+    {
+        if v > 0.0 && (v as u64) <= max_ctx {
+            ctx_tokens = v as u64;
+        }
+    }
+    // fallback: last message's usage from the transcript tail — covers older Claude
+    // Code builds that don't send context_window, or a rejected value above. Only
+    // runs when the payload count is absent, so the normal path does no file I/O.
+    if ctx_tokens == 0 && !transcript.is_empty() {
         if let Ok(mut f) = fs::File::open(transcript) {
             if let Ok(len) = f.seek(SeekFrom::End(0)) {
                 let start = len.saturating_sub(256 * 1024);
@@ -1063,17 +1078,6 @@ fn main() {
                         }
                     }
                 }
-            }
-        }
-    }
-    // fallback: harness field, accepted only when it fits inside the window
-    if ctx_tokens == 0 {
-        if let Some(v) = cw
-            .and_then(|c| c.get("total_input_tokens"))
-            .and_then(Json::as_f64)
-        {
-            if v > 0.0 && (v as u64) <= max_ctx {
-                ctx_tokens = v as u64;
             }
         }
     }
