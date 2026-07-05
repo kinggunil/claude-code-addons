@@ -49,28 +49,31 @@ Tools "Desktop development with C++"), and Python for the automatic
 
 ## 1. Status line
 
-Two lines under the prompt:
+Two lines under the prompt, split by domain — your **Claude session** on top,
+**this machine** below:
 
 ```
-claude --resume <sid> | 4h 31m | $2.74 | 5h  9% (3h 54m) | 7d 23/18% (+5% 8h24m) (5d 17h)
-Opus 4.8 (1M) | ⚡xhigh | think on | mydir | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | CPU 10% | RAM 56% | VM 62% | 🏠 my-mac | v26.07.05
+Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% (3h 54m) | 7d 23/18% (+5% 8h24m) (5d 17h) | 4h 31m · $2.74
+mydir | 🏠 my-mac · CPU 10% · RAM 56% · VM 62% | v26.07.05 | claude --resume <sid>
 ```
 
-On an SSH session the host segment turns orange and switches icon, so you always
-know which machine the session is really on:
+On an SSH session the host segment turns orange and switches icon, so the whole
+bottom line reads as "the box this session is really on":
 
 ```
-… | CPU 10% | RAM 56% | VM  0% | 🌐 ip-10-0-1-23 | v26.07.05
+mydir | 🌐 ip-10-0-1-23 · CPU 10% · RAM 56% · VM  0% | v26.07.05 | claude --resume <sid>
 ```
 
-- **Line 1**: resume command, elapsed time, cost, Claude.ai rate-limit usage
-  (Pro/Max). The 7-day window is a **weekly pace** gauge: `used% / week-elapsed%`
-  plus how far ahead of / behind the linear "on-pace" line you are, colored by
-  headroom, with a countdown to the Saturday-04:00-KST reset.
-- **Line 2**: model, effort, thinking toggle, dir, context gauge, CPU/RAM/VM, the
-  machine **host** (🏠 dim = local, 🌐 orange = SSH remote — the hostname comes
-  from wherever the status line runs, so under SSH it names the remote box), and a
-  `vYY.MM.DD` build tag (compare it against the repo to spot stale machines).
+- **Line 1 — Claude session**: model, effort, thinking toggle, context gauge,
+  then Claude.ai rate-limit usage (Pro/Max). The 7-day window is a **weekly pace**
+  gauge: `used% / week-elapsed%` plus how far ahead of / behind the linear
+  "on-pace" line you are, colored by headroom, with a countdown to the
+  Saturday-04:00-KST reset; then elapsed time and cost.
+- **Line 2 — this machine**: working dir, the machine **host** (🏠 dim = local,
+  🌐 orange = SSH remote — the hostname comes from wherever the status line runs,
+  so under SSH it names the remote box), CPU/RAM/VM, a `vYY.MM.DD` build tag
+  (compare it against the repo to spot stale machines), and the full
+  `claude --resume` command at the far right.
 
 All stats come from direct syscalls (macOS `mach`/`sysctl`, Linux `/proc`,
 Windows `kernel32`) — no subprocesses, ~2–5 ms per refresh.

@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.2";
+const VERSION: &str = "26.07.05.9";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -1099,65 +1099,69 @@ fn main() {
         .and_then(Json::as_bool)
         .unwrap_or(false);
 
-    let sep = format!(" {}|{} ", C_SEP, RESET);
+    let sep = format!(" {}|{} ", C_SEP, RESET); // between sectors
+    let dot = format!(" {}·{} ", C_SEP, RESET); // within a sector (line 2)
 
-    // ---- line 1: session meta, all dim/quiet (resume cmd | elapsed | cost | rate limits) ----
-    let mut meta: Vec<String> = Vec::new();
-    if !sid.is_empty() {
-        meta.push(format!("claude --resume {}", sid));
-    }
-    if let Some(ds) = &dur_str {
-        meta.push(ds.clone());
-    }
-    if cost_usd > 0.0 {
-        meta.push(format!("${:.2}", cost_usd));
-    }
-    // rate limits: Pro/Max only, appears after the first API response; each
-    // window (five_hour, seven_day) may be independently absent.
+    // ---- line 1 (dim): [spend: elapsed · cost] | [5h] | [7d] | [resume] ----
+    // ordered by glance-frequency: budget first, the rarely-read resume id last.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|t| t.as_secs_f64());
+    let mut meta: Vec<String> = Vec::new();
+
+    // limits first — the real constraints (colored, high value). Pro/Max only,
+    // appears after the first API response; each window may be independently absent.
     let mut seven_used = None;
     let mut seven_reset = None;
     if let Some(rl) = d.get("rate_limits") {
-        // 5h window stays a plain used%/countdown segment
         if let Some(pct) = rl.path(&["five_hour", "used_percentage"]).and_then(Json::as_f64) {
             let resets_at = rl.path(&["five_hour", "resets_at"]).and_then(Json::as_f64);
             meta.push(rate_limit_segment("5h", pct, resets_at, now));
         }
-        // 7d window feeds the weekly pace segment below
         seven_used = rl.path(&["seven_day", "used_percentage"]).and_then(Json::as_f64);
         seven_reset = rl.path(&["seven_day", "resets_at"]).and_then(Json::as_f64);
     }
-    // weekly time-progress + pace — shown even without rate-limit data, since the
-    // Saturday-04:00-KST week position is meaningful on its own
     if let Some(n) = now {
         meta.push(weekly_segment(seven_used, seven_reset, n));
     }
-    let line1 = meta
-        .iter()
-        .map(|m| format!("{}{}{}", C_DIM, m, RESET))
-        .collect::<Vec<_>>()
-        .join(&sep);
 
-    // ---- line 2: live status (model | effort | think | dir | context | CPU/RAM/VM) ----
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("{}{}{}{}", BOLD, C_MODEL, model, RESET));
-    if !effort.is_empty() {
-        parts.push(format!("{}⚡{}{}", color_for_effort(effort), effort, RESET));
+    // lower priority: elapsed · cost — demoted to the right, plain dim (cost is an
+    // API-equivalent figure, not a subscription charge), just before the resume ref.
+    let mut spend: Vec<String> = Vec::new();
+    if let Some(ds) = &dur_str {
+        spend.push(ds.clone());
     }
-    parts.push(if thinking {
+    if cost_usd > 0.0 {
+        spend.push(format!("${:.2}", cost_usd));
+    }
+    if !spend.is_empty() {
+        meta.push(spend.join(" · "));
+    }
+
+
+    // ---- Two lines split by domain ----
+    //   Claude (session): mode · context | 5h | 7d | elapsed·cost
+    //   Local  (machine): dir | host · CPU · RAM · VM | version | resume
+    let mut claude: Vec<String> = Vec::new();
+
+    // mode sector: model · effort · think
+    let mut mode: Vec<String> = Vec::new();
+    // drop the verbose " context" suffix (e.g. "Opus 4.8 (1M context)" -> "(1M)")
+    mode.push(format!("{}{}{}{}", BOLD, C_MODEL, model.replace(" context", ""), RESET));
+    if !effort.is_empty() {
+        mode.push(format!("{}⚡{}{}", color_for_effort(effort), effort, RESET));
+    }
+    mode.push(if thinking {
         format!("{}think on{}", C_ON, RESET)
     } else {
         format!("{}think off{}", C_OFF, RESET)
     });
-    parts.push(format!("{}{}{}", C_DIR, base, RESET));
+    claude.push(mode.join(&dot));
+
+    // context sector: the most-actionable live metric, placed right after mode.
     if ctx_tokens > 0 {
         // % is derived from the same number as the displayed X/Y — they always agree.
-        // Clipped defensively: transcript-tail tokens should always be <= the
-        // window (see file header), but this guards against that invariant
-        // ever breaking and showing a nonsensical >100% reading.
         let pct = if max_ctx > 0 {
             clip(ctx_tokens as f64 / max_ctx as f64 * 100.0)
         } else {
@@ -1169,7 +1173,7 @@ fn main() {
         } else {
             ctx_emoji(pct)
         };
-        parts.push(format!(
+        claude.push(format!(
             "{} {} {}{}/{} ({:.1}%){}",
             emo,
             bar(pct, 10),
@@ -1181,32 +1185,56 @@ fn main() {
         ));
     }
 
-    let cpu = cpu_percent();
-    let (ram, vm) = plat::mem();
-    for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
-        if let Some(v) = val {
-            parts.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
-        }
+    // remaining session refs (5h | 7d | elapsed·cost), dim on the right
+    for m in &meta {
+        claude.push(format!("{}{}{}", C_DIM, m, RESET));
     }
-    // host: which machine this session runs on. 🏠 dim = local, 🌐 orange = SSH
-    // remote (so an EC2 session is unmistakable). Short hostname; domain stripped.
+    let claude_line = claude.join(&sep);
+
+    // ---- Local (machine) line: dir | host · CPU · RAM · VM | version ----
+    let mut local: Vec<String> = Vec::new();
+
+    // dir sector
+    local.push(format!("{}{}{}", C_DIR, base, RESET));
+
+    // machine sector: host · CPU · RAM · VM (host leads — 🏠 local / 🌐 SSH remote)
+    let mut machine: Vec<String> = Vec::new();
     if let Some(h) = hostname() {
         let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
             || std::env::var_os("SSH_TTY").is_some();
         if is_ssh {
-            parts.push(format!("{}🌐 {}{}", fg(214), h, RESET));
+            machine.push(format!("{}🌐 {}{}", fg(214), h, RESET));
         } else {
-            parts.push(format!("{}🏠 {}{}", C_DIM, h, RESET));
+            machine.push(format!("{}🏠 {}{}", C_DIM, h, RESET));
         }
     }
-    // version last: far-right build tag for cross-machine update checks
-    parts.push(format!("{}v{}{}", C_DIM, VERSION, RESET));
-    let line2 = parts.join(&sep);
+    let cpu = cpu_percent();
+    let (ram, vm) = plat::mem();
+    for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
+        if let Some(v) = val {
+            machine.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
+        }
+    }
+    if !machine.is_empty() {
+        local.push(machine.join(&dot));
+    }
 
-    if line1.is_empty() {
-        print!("{}", line2);
+    // version: build tag for cross-machine update checks
+    local.push(format!("{}v{}{}", C_DIM, VERSION, RESET));
+
+    // resume: full command at the far right of the machine line (dim reference;
+    // rightmost so a narrow terminal truncates it first, not the stats you watch).
+    if !sid.is_empty() {
+        local.push(format!("{}claude --resume {}{}", C_DIM, sid, RESET));
+    }
+
+    let local_line = local.join(&sep);
+
+    if claude_line.is_empty() {
+        print!("{}", local_line);
     } else {
-        print!("{}\n{}", line1, line2);
+        // Claude session on top, this machine below (nearest the prompt)
+        print!("{}\n{}", claude_line, local_line);
     }
 }
 
