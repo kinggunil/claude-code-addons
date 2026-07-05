@@ -39,17 +39,17 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 ```
 Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% (3h 54m) | 7d 23/18% (+5% 8h24m) (5d 17h) | 4h 31m · $2.74
-mydir | 🏠 my-mac · CPU 10% · RAM 56% · VM 62% | v26.07.05 | claude --resume <sid>
+CPU 10% · RAM 56% · VM 62% · 🏠 my-mac | mydir | v26.07.05 | claude --resume <sid>
 ```
 
 SSH 세션에서는 호스트 세그먼트가 주황색 🌐로 바뀌어, 아랫줄 전체가 "이 세션이 실제로 도는 박스"처럼 읽힙니다:
 
 ```
-mydir | 🌐 ip-10-0-1-23 · CPU 10% · RAM 56% · VM  0% | v26.07.05 | claude --resume <sid>
+CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude --resume <sid>
 ```
 
 - **1줄 — Claude 세션**: 모델, effort, thinking 토글, 컨텍스트 게이지, 그다음 Claude.ai 사용량 한도(Pro/Max). 7일 창은 **주간 페이스** 게이지입니다: `사용%/주 경과%` 와 함께, 선형 "정상 페이스" 대비 얼마나 앞서/뒤처졌는지를 여유에 따라 색으로 표시하고, 토요일 04:00 KST 리셋까지 카운트다운을 보여줍니다. 이어서 경과 시간과 비용.
-- **2줄 — 이 머신**: 작업 디렉터리, 머신 **호스트**(🏠 회색=로컬, 🌐 주황=SSH 원격 — 호스트명은 상태줄이 실행되는 머신에서 오므로 SSH에선 원격 서버 이름을 표시), CPU/RAM/VM, `vYY.MM.DD` 빌드 태그(저장소 버전과 비교해 오래된 머신 파악), 그리고 맨 오른쪽에 전체 `claude --resume` 명령.
+- **2줄 — 이 머신**: CPU/RAM/VM을 맨 앞에(실시간으로 변하는 유일한 값이라 왼쪽 첫 자리에 배치), 그다음 머신 **호스트**(🏠 회색=로컬, 🌐 주황=SSH 원격 — 호스트명은 상태줄이 실행되는 머신에서 오므로 SSH에선 원격 서버 이름을 표시), 작업 디렉터리, `vYY.MM.DD` 빌드 태그(저장소 버전과 비교해 오래된 머신 파악), 그리고 맨 오른쪽에 전체 `claude --resume` 명령.
 
 모든 수치는 직접 시스템콜로 수집합니다(macOS `mach`/`sysctl`, Linux `/proc`, Windows `kernel32`) — 서브프로세스 없이 갱신당 ~2–5ms.
 

@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.9";
+const VERSION: &str = "26.07.05.11";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -1142,7 +1142,7 @@ fn main() {
 
     // ---- Two lines split by domain ----
     //   Claude (session): mode · context | 5h | 7d | elapsed·cost
-    //   Local  (machine): dir | host · CPU · RAM · VM | version | resume
+    //   Local  (machine): CPU · RAM · VM · host | dir | version | resume
     let mut claude: Vec<String> = Vec::new();
 
     // mode sector: model · effort · think
@@ -1191,14 +1191,19 @@ fn main() {
     }
     let claude_line = claude.join(&sep);
 
-    // ---- Local (machine) line: dir | host · CPU · RAM · VM | version ----
+    // ---- Local (machine) line: CPU · RAM · VM · host | dir | version | resume ----
     let mut local: Vec<String> = Vec::new();
 
-    // dir sector
-    local.push(format!("{}{}{}", C_DIR, base, RESET));
-
-    // machine sector: host · CPU · RAM · VM (host leads — 🏠 local / 🌐 SSH remote)
+    // machine sector first, live meters leading: CPU · RAM · VM at the very left
+    // edge (first-read anchor), then host (🏠 local / 🌐 SSH remote)
     let mut machine: Vec<String> = Vec::new();
+    let cpu = cpu_percent();
+    let (ram, vm) = plat::mem();
+    for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
+        if let Some(v) = val {
+            machine.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
+        }
+    }
     if let Some(h) = hostname() {
         let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
             || std::env::var_os("SSH_TTY").is_some();
@@ -1208,16 +1213,12 @@ fn main() {
             machine.push(format!("{}🏠 {}{}", C_DIM, h, RESET));
         }
     }
-    let cpu = cpu_percent();
-    let (ram, vm) = plat::mem();
-    for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
-        if let Some(v) = val {
-            machine.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
-        }
-    }
     if !machine.is_empty() {
         local.push(machine.join(&dot));
     }
+
+    // dir sector
+    local.push(format!("{}{}{}", C_DIR, base, RESET));
 
     // version: build tag for cross-machine update checks
     local.push(format!("{}v{}{}", C_DIM, VERSION, RESET));
