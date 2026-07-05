@@ -35,7 +35,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "26.07.05.5";
+const VERSION: &str = "26.07.05.16";
 
 // The only embedded sound: the default voice saying "claude", pre-rendered TTS
 // baked to 16-bit PCM WAV, so no speech engine is needed at runtime and it

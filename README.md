@@ -39,6 +39,22 @@ yourself first), compiles both binaries into `~/.claude`, writes a default
 the `statusLine` block **and** three `claude-notify` hooks. Existing settings are
 preserved and backed up to `settings.json.bak`; re-running is idempotent.
 
+**It also configures the sound target for you.** The installer detects whether
+this machine has speakers or is a headless / SSH box and sets things up
+accordingly, so the same one-liner does the right thing on both ends:
+
+- **Speaker machine** (local macOS/desktop, or not in an SSH session) → writes
+  `remote: ""` (play locally) **and auto-starts the playback daemon**
+  (`install-daemon`) so it's ready to receive chimes from your remote boxes.
+- **Headless / SSH box** (installed inside an SSH session, or Linux with no
+  sound card) → writes `remote: "127.0.0.1:47291"` so the chime is forwarded to
+  your speaker machine's daemon over an SSH tunnel; no local daemon is started.
+
+An existing `.claude-notify.json` is never overwritten. The only manual steps
+left for the SSH case are the one-line `RemoteForward` in your local
+`~/.ssh/config` and **reconnecting the SSH session** (a running session can't
+gain the tunnel retroactively) — see [Using it over SSH](#using-it-over-ssh-eg-an-ec2-box).
+
 **Requirements:** `curl` and a C linker for the Rust compile — `cc`/`clang`/`gcc`
 (Xcode Command Line Tools on macOS: `xcode-select --install`; `build-essential`
 or `gcc` on Linux). On Windows: [Rust](https://rustup.rs) + a linker (VS Build
@@ -111,7 +127,9 @@ No recompile, no hook edits — just change this file:
 - **`completed` / `question`** — the sound for each event: the built-in
   `claude`, or an **absolute path to your own 16-bit PCM `.wav`**. You can set
   them differently.
-- **`remote`** — where to play (see below). `""` = play on this machine.
+- **`remote`** — where to play (see below). `""` = play on this machine. The
+  installer sets this automatically (`""` on a speaker machine, `127.0.0.1:47291`
+  on a headless/SSH box); change it here to override.
 
 ### CLI
 
@@ -146,7 +164,9 @@ have an SSH session at all.
 
 ### Setup
 
-**1. On your local machine (with speakers)** — run the daemon and keep it up:
+**1. On your local machine (with speakers)** — run the daemon and keep it up.
+**The installer already does this for you** on a speaker machine; run it by hand
+only if you skipped that or want to re-arm it:
 
 ```sh
 claude-notify install-daemon          # macOS launchd / Linux systemd --user
@@ -162,12 +182,16 @@ Host my-ec2
   RemoteForward 47291 127.0.0.1:47291
 ```
 
-**3. On the server** — install claude-code-addons there too, then set `remote`
-in its `~/.claude/.claude-notify.json`:
+**3. On the server** — install claude-code-addons there too. Because you install
+it inside an SSH session, the installer **auto-sets** `remote` to
+`127.0.0.1:47291` in its `~/.claude/.claude-notify.json` (no local daemon is
+started on the headless box). If you ever need to set it by hand:
 
 ```json
 { "vol": 2.0, "completed": "claude", "question": "claude", "remote": "127.0.0.1:47291" }
 ```
+
+Then **reconnect the SSH session** so the `RemoteForward` tunnel is active for it.
 
 Now when a long task finishes on the server, your **local machine speaks
 "claude"**. If the daemon is down or forwarding is disabled, you still get a

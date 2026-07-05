@@ -57,11 +57,30 @@ echo "==> compiling claude-notify -> $CN_BIN"
 rustc --edition 2021 -O "$CN_SRC" -o "$CN_BIN"
 
 # ---- 4. default config (never clobber an existing one) ----
+# Auto-pick "remote": a headless / SSH box forwards its chime to a speaker
+# machine's daemon over the SSH RemoteForward tunnel; a machine with its own
+# speakers plays locally (""). Headless when we're inside an SSH session
+# ($SSH_CONNECTION) or Linux reports no ALSA sound card.
+is_headless() {
+  [ -n "$SSH_CONNECTION" ] && return 0             # installing over SSH -> remote box
+  [ "$(uname -s)" = "Linux" ] || return 1          # local macOS/other -> has speakers
+  { [ -r /proc/asound/cards ] && grep -q '\[' /proc/asound/cards 2>/dev/null; } && return 1
+  return 0                                          # Linux, no sound card -> headless
+}
+if is_headless; then REMOTE_DEFAULT="127.0.0.1:47291"; else REMOTE_DEFAULT=""; fi
+
 if [ ! -f "$CFG" ]; then
-  echo "==> writing default config -> $CFG"
-  printf '{\n  "vol": 2.0,\n  "completed": "claude",\n  "question": "claude",\n  "remote": ""\n}\n' > "$CFG"
+  echo "==> writing default config -> $CFG (remote=\"$REMOTE_DEFAULT\")"
+  printf '{\n  "vol": 2.0,\n  "completed": "claude",\n  "question": "claude",\n  "remote": "%s"\n}\n' "$REMOTE_DEFAULT" > "$CFG"
 else
   echo "==> keeping existing $CFG"
+fi
+
+# ---- 4b. speaker machine: start the playback daemon automatically ----
+# (a headless box has nothing to play through — it forwards instead, so skip.)
+if [ -z "$REMOTE_DEFAULT" ]; then
+  echo "==> starting playback daemon (this machine has speakers)"
+  "$CN_BIN" install-daemon || echo "    (daemon not started; run \"$CN_BIN install-daemon\" manually)"
 fi
 
 # ---- 5. patch settings.json: statusLine key + claude-notify hooks ----
@@ -130,4 +149,11 @@ echo '{}' | "$SL_BIN"
 echo
 echo "==> claude-notify: $("$CN_BIN" --version)"
 echo "==> test the chime:  printf '{}' | \"$CN_BIN\" play"
+if [ -n "$REMOTE_DEFAULT" ]; then
+  echo "==> remote/headless box detected — chime is forwarded to $REMOTE_DEFAULT."
+  echo "    On your LOCAL machine (with speakers): install this repo there (it auto-starts"
+  echo "    the daemon), and add to that machine's ~/.ssh/config for this host:"
+  echo "        RemoteForward 47291 127.0.0.1:47291"
+  echo "    Then RECONNECT this SSH session so the tunnel is active."
+fi
 echo "==> done. Restart Claude Code (or start a new session) to activate everything."

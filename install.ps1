@@ -32,16 +32,28 @@ rustc --edition 2021 -O $slSrc -o $slBin
 Write-Host "==> compiling claude-notify -> $cnBin"
 rustc --edition 2021 -O $cnSrc -o $cnBin
 
+# Auto-pick "remote": an SSH/headless box forwards its chime to a speaker
+# machine's daemon over the SSH RemoteForward tunnel; a local desktop plays
+# locally (""). On Windows, being inside an SSH session is the headless signal.
+$remote = if ($env:SSH_CONNECTION) { "127.0.0.1:47291" } else { "" }
 if (-not (Test-Path $cfg)) {
-  Write-Host "==> writing default config -> $cfg"
-@'
+  Write-Host "==> writing default config -> $cfg (remote=`"$remote`")"
+@"
 {
   "vol": 2.0,
   "completed": "claude",
   "question": "claude",
-  "remote": ""
+  "remote": "$remote"
 }
-'@ | Set-Content -Path $cfg -Encoding utf8
+"@ | Set-Content -Path $cfg -Encoding utf8
+} else {
+  Write-Host "==> keeping existing $cfg"
+}
+
+# speaker machine (local desktop): start the playback daemon automatically
+if (-not $remote) {
+  Write-Host "==> starting playback daemon (this machine has speakers)"
+  try { & $cnBin install-daemon } catch { Write-Host "    (run '$cnBin install-daemon' manually)" }
 }
 
 # ---- patch settings.json — reuse the Python patcher when available (robust),
@@ -89,5 +101,11 @@ print("    ok")
 }
 
 Write-Host ("==> claude-notify: " + (& $cnBin --version))
+if ($remote) {
+  Write-Host "==> remote/SSH box detected — chime is forwarded to $remote."
+  Write-Host "    On your LOCAL machine (with speakers): install this repo there (it auto-starts"
+  Write-Host "    the daemon), add 'RemoteForward 47291 127.0.0.1:47291' to its ~/.ssh/config for"
+  Write-Host "    this host, then RECONNECT this SSH session so the tunnel is active."
+}
 Write-Host "==> done. Restart Claude Code to activate."
 Write-Host "==> test the chime:  '{}' | & '$cnBin' play"

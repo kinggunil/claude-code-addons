@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.15";
+const VERSION: &str = "26.07.05.16";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";

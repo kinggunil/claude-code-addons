@@ -29,6 +29,13 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 설치 스크립트는 소스 + 내장 음성을 내려받고, `rustc`가 없으면 rustup으로 Rust 툴체인을 설치(macOS/Linux; Windows는 Rust를 먼저 직접 설치)한 뒤 두 바이너리를 `~/.claude`에 컴파일하고, 기본 설정 `~/.claude/.claude-notify.json`을 작성하고, `~/.claude/settings.json`에 `statusLine` 블록과 `claude-notify` 훅 3개를 추가합니다. 기존 설정은 보존되고 `settings.json.bak`으로 백업되며, 재실행해도 중복되지 않습니다(idempotent).
 
+**소리 전송 대상도 자동으로 설정합니다.** 설치 스크립트가 이 머신이 스피커 있는 기계인지 헤드리스/SSH 박스인지 감지해서 맞게 세팅하므로, 같은 한 줄 명령이 양쪽에서 알아서 올바르게 동작합니다:
+
+- **스피커 있는 기계**(로컬 macOS/데스크톱, 또는 SSH 세션이 아닐 때) → `remote: ""`(로컬 재생)로 쓰고, **재생 데몬을 자동 실행**(`install-daemon`)해서 원격 박스들의 알림을 받을 준비를 합니다.
+- **헤드리스/SSH 박스**(SSH 세션 안에서 설치했거나, 사운드카드 없는 Linux) → `remote: "127.0.0.1:47291"`로 써서, 알림을 SSH 터널로 스피커 있는 기계의 데몬에 전달합니다. 이 경우 로컬 데몬은 띄우지 않습니다.
+
+기존 `.claude-notify.json`은 절대 덮어쓰지 않습니다. SSH 상황에서 수동으로 남는 건 로컬 `~/.ssh/config`의 `RemoteForward` 한 줄과 **SSH 세션 재접속**(실행 중인 세션엔 터널을 소급 적용할 수 없음)뿐입니다 — [SSH로 원격 작업할 때](#ssh로-원격-작업할-때-예-ec2) 참고.
+
 **요구 사항:** `curl`과 Rust 컴파일용 C 링커 — `cc`/`clang`/`gcc`(macOS는 Xcode Command Line Tools: `xcode-select --install`, Linux는 `build-essential` 또는 `gcc`). Windows는 [Rust](https://rustup.rs) + 링커(VS Build Tools의 "C++를 사용한 데스크톱 개발")와, `settings.json` 자동 패치를 위한 Python(없으면 수동 추가할 JSON을 안내).
 
 ---
@@ -80,7 +87,7 @@ CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude -
 
 - **`vol`** — 선형 볼륨. 내장 음성 피크가 약 56% FS라 ~`1.8`이 클리핑 없는 최대치이고, 그보다 크면 약간의 클리핑과 함께 더 커집니다. 기본 `2.0`.
 - **`completed` / `question`** — 각 이벤트의 소리: 내장 `claude`, 또는 **직접 만든 16-bit PCM `.wav`의 절대 경로**. 둘을 다르게 지정할 수 있습니다.
-- **`remote`** — 어디서 재생할지(아래 참고). `""`면 이 머신에서 재생.
+- **`remote`** — 어디서 재생할지(아래 참고). `""`면 이 머신에서 재생. 설치 스크립트가 자동으로 정합니다(스피커 있는 기계면 `""`, 헤드리스/SSH 박스면 `127.0.0.1:47291`). 바꾸려면 여기서 수정.
 
 ### CLI
 
@@ -106,7 +113,7 @@ claude-notify --version
 
 ### 설정
 
-**1. 로컬 머신(스피커 있는 쪽)** — 데몬을 상시 실행:
+**1. 로컬 머신(스피커 있는 쪽)** — 데몬을 상시 실행. **스피커 있는 기계라면 설치 스크립트가 이미 해줍니다.** 건너뛰었거나 다시 걸고 싶을 때만 수동 실행:
 
 ```sh
 claude-notify install-daemon          # macOS launchd / Linux systemd --user
@@ -122,11 +129,13 @@ Host my-ec2
   RemoteForward 47291 127.0.0.1:47291
 ```
 
-**3. 서버** — 서버에도 claude-code-addons를 설치한 뒤, 서버의 `~/.claude/.claude-notify.json`에서 `remote`를 지정:
+**3. 서버** — 서버에도 claude-code-addons를 설치합니다. SSH 세션 안에서 설치하므로 설치 스크립트가 서버의 `~/.claude/.claude-notify.json`에서 `remote`를 `127.0.0.1:47291`로 **자동 설정**합니다(헤드리스 박스에는 로컬 데몬을 띄우지 않음). 수동으로 지정해야 할 때:
 
 ```json
 { "vol": 2.0, "completed": "claude", "question": "claude", "remote": "127.0.0.1:47291" }
 ```
+
+그다음 **SSH 세션을 재접속**해야 해당 세션에 `RemoteForward` 터널이 붙습니다.
 
 이제 서버에서 긴 작업이 끝나면 **내 로컬 머신이 "claude"라고 말합니다.** 데몬이 꺼져 있거나 포워딩이 막혀 있으면 터미널 벨이 대신 울립니다.
 
