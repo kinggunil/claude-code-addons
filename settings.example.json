@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "model": "opus[1m]",
+  "effortLevel": "xhigh",
+  "skipDangerousModePermissionPrompt": true,
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/.claude/statusline-rs",
+    "refreshInterval": 1
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/claude-notify mark" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/claude-notify play --event completed --threshold 60" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/claude-notify play --event question" }
+        ]
+      }
+    ]
+  }
+}

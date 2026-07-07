@@ -38,6 +38,18 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 **요구 사항:** `curl`과 Rust 컴파일용 C 링커 — `cc`/`clang`/`gcc`(macOS는 Xcode Command Line Tools: `xcode-select --install`, Linux는 `build-essential` 또는 `gcc`). Windows는 [Rust](https://rustup.rs) + 링커(VS Build Tools의 "C++를 사용한 데스크톱 개발")와, `settings.json` 자동 패치를 위한 Python(없으면 수동 추가할 JSON을 안내).
 
+### 설정 예시
+
+[`settings.example.json`](settings.example.json)은 동작하는 `~/.claude/settings.json`의
+참고 예시입니다. 설치 스크립트는 이 중 `statusLine` 블록과 `claude-notify` 훅 3개만
+기존 설정에 병합합니다 — 이 애드온에 필요한 부분은 그게 전부이며, 경로는
+`$HOME/.claude/...` 형태입니다(설치 스크립트가 실제 절대경로를 써 줍니다).
+
+나머지 키들은 작성자의 개인 취향 Claude Code 기본값입니다(`model`, `effortLevel`,
+`enabledPlugins`) — 원하면 골라서 복사하세요. `"defaultMode": "bypassPermissions"`와
+`"skipDangerousModePermissionPrompt": true`는 **Claude Code의 권한 확인 프롬프트를 꺼 버리므로**,
+복사하기 전에 그 트레이드오프를 이해하세요.
+
 ---
 
 ## 1. 상태줄(status line)

@@ -61,6 +61,20 @@ or `gcc` on Linux). On Windows: [Rust](https://rustup.rs) + a linker (VS Build
 Tools "Desktop development with C++"), and Python for the automatic
 `settings.json` patch (otherwise the installer prints the JSON to add by hand).
 
+### Example config
+
+[`settings.example.json`](settings.example.json) is a reference of a working
+`~/.claude/settings.json`. The installer only merges the `statusLine` block and
+the three `claude-notify` hooks into whatever settings you already have — those
+are the parts you need for these add-ons, and they use `$HOME/.claude/...`
+(the installer writes your real absolute path).
+
+The rest of the keys in the example are the author's personal, opinionated
+Claude Code defaults (`model`, `effortLevel`, `enabledPlugins`) — copy them only
+if you want them. Note `"defaultMode": "bypassPermissions"` and
+`"skipDangerousModePermissionPrompt": true` **turn off Claude Code's permission
+prompts**; understand that trade-off before copying them.
+
 ---
 
 ## 1. Status line
