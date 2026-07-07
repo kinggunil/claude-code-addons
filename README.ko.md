@@ -40,15 +40,21 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 ### 설정 예시
 
-[`settings.example.json`](settings.example.json)은 동작하는 `~/.claude/settings.json`의
-참고 예시입니다. 설치 스크립트는 이 중 `statusLine` 블록과 `claude-notify` 훅 3개만
-기존 설정에 병합합니다 — 이 애드온에 필요한 부분은 그게 전부이며, 경로는
-`$HOME/.claude/...` 형태입니다(설치 스크립트가 실제 절대경로를 써 줍니다).
+[`settings.example.json`](settings.example.json)은 동작하는 `~/.claude/settings.json`
+참고 예시이며, 두 그룹으로 나눠 표시해 뒀습니다:
 
-나머지 키들은 작성자의 개인 취향 Claude Code 기본값입니다(`model`, `effortLevel`,
-`enabledPlugins`) — 원하면 골라서 복사하세요. `"defaultMode": "bypassPermissions"`와
-`"skipDangerousModePermissionPrompt": true`는 **Claude Code의 권한 확인 프롬프트를 꺼 버리므로**,
-복사하기 전에 그 트레이드오프를 이해하세요.
+- **(A) 애드온에 필요한 부분** — `statusLine` 블록과 `claude-notify` 훅 3개. 설치
+  스크립트는 **이것만** 기존 설정에 병합합니다(직접 넣을 필요 없음).
+- **(B) 작성자 개인 취향** (`model`, `effortLevel`, `enabledPlugins`,
+  `permissions.defaultMode`) — 설치기가 건드리지 않으니 **원하는 것만 골라 복사**하세요.
+  `"defaultMode": "bypassPermissions"`와 `"skipDangerousModePermissionPrompt": true`는
+  **Claude Code의 권한 확인 프롬프트를 꺼 버리므로** 복사 전에 이해하고 쓰세요.
+
+**경로는 OS마다 다릅니다.** 예시는 macOS/Linux 형태(`$HOME/.claude/statusline-rs`,
+확장자 없음)입니다. Windows에서는 설치기가 `.exe` 절대경로로 씁니다(예:
+`C:\Users\you\.claude\statusline-rs.exe`, `claude-notify.exe`). 어느 쪽이든 설치기가
+그 머신에 맞는 경로를 알아서 채워 주며, 이 예시는 수동 설치용 참고일 뿐입니다.
+(파일 안의 `_` 로 시작하는 키는 주석이며, Claude Code는 모르는 키를 무시합니다.)
 
 ---
 

@@ -64,16 +64,23 @@ Tools "Desktop development with C++"), and Python for the automatic
 ### Example config
 
 [`settings.example.json`](settings.example.json) is a reference of a working
-`~/.claude/settings.json`. The installer only merges the `statusLine` block and
-the three `claude-notify` hooks into whatever settings you already have — those
-are the parts you need for these add-ons, and they use `$HOME/.claude/...`
-(the installer writes your real absolute path).
+`~/.claude/settings.json`, split into two labelled groups:
 
-The rest of the keys in the example are the author's personal, opinionated
-Claude Code defaults (`model`, `effortLevel`, `enabledPlugins`) — copy them only
-if you want them. Note `"defaultMode": "bypassPermissions"` and
-`"skipDangerousModePermissionPrompt": true` **turn off Claude Code's permission
-prompts**; understand that trade-off before copying them.
+- **(A) what the add-ons need** — the `statusLine` block and the three
+  `claude-notify` hooks. The installer merges *only these* into whatever settings
+  you already have; you don't add them by hand.
+- **(B) the author's personal preferences** (`model`, `effortLevel`,
+  `enabledPlugins`, `permissions.defaultMode`) — the installer never touches
+  these; copy only the ones you want. Note `"defaultMode": "bypassPermissions"`
+  and `"skipDangerousModePermissionPrompt": true` **turn off Claude Code's
+  permission prompts** — understand that before copying them.
+
+**Paths are OS-specific.** The example uses the macOS/Linux form
+(`$HOME/.claude/statusline-rs`, no extension). On Windows the installer instead
+writes an absolute path with `.exe` (e.g. `C:\Users\you\.claude\statusline-rs.exe`
+and `claude-notify.exe`). Either way the installer fills in the correct path for
+your machine — the example is only a manual-setup reference. (The `_`-prefixed
+keys in the file are annotations; Claude Code ignores unknown keys.)
 
 ---
 
