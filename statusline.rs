@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.05.16";
+const VERSION: &str = "26.07.11";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -884,15 +884,24 @@ fn fmt_span_compact(secs: f64) -> Option<String> {
     })
 }
 
-/// Color for the pace delta = used - elapsed (percentage points): strongly
-/// negative means lots of headroom (green), around zero is on-pace (yellow),
-/// strongly positive means burning ahead of the clock (red). A gradient so the
-/// color tracks *how much* headroom there is — 여유에 따라 색깔 다르게.
+/// Color for the pace delta = used - elapsed (percentage points). Uses the rounded
+/// delta for the under/on boundary so the color always agrees with the words.
+/// Under pace (headroom) steps warm→cool as the cushion grows — yellow-green →
+/// green → cyan → blue — so bluer == more room to spare. On-pace is yellow, and
+/// over pace burns ahead of the clock through yellow→orange→red — 여유에 따라 색깔 다르게.
 fn pace_color(delta: f64) -> String {
-    fg(if delta <= -15.0 {
-        42 // green — comfortably ahead
-    } else if delta <= -5.0 {
-        148 // yellow-green
+    fg(if delta.round() < 0.0 {
+        // under pace: stepped by how much headroom (-delta), warm → cool
+        let headroom = -delta;
+        if headroom < 5.0 {
+            148 // yellow-green — 연두: only a little ahead
+        } else if headroom < 15.0 {
+            42 // green — 초록: comfortably ahead
+        } else if headroom < 30.0 {
+            45 // cyan — 하늘색: lots of room
+        } else {
+            33 // blue — 파랑: way ahead, tons of headroom
+        }
     } else if delta < 5.0 {
         220 // yellow — on pace
     } else if delta < 15.0 {
@@ -1415,8 +1424,16 @@ mod tests {
 
     #[test]
     fn pace_color_tracks_headroom() {
-        assert_eq!(pace_color(-30.0), fg(42)); // deep headroom -> green
+        // under pace: stepped warm -> cool as headroom grows
+        assert_eq!(pace_color(-3.0), fg(148)); // slight headroom -> yellow-green
+        assert_eq!(pace_color(-0.5), fg(148)); // rounds to -1% under pace -> yellow-green
+        assert_eq!(pace_color(-10.0), fg(42)); // comfortable -> green
+        assert_eq!(pace_color(-20.0), fg(45)); // lots of room -> cyan
+        assert_eq!(pace_color(-30.0), fg(33)); // way ahead -> blue
+        // on pace and over pace
+        assert_eq!(pace_color(-0.3), fg(220)); // rounds to on pace -> yellow
         assert_eq!(pace_color(0.0), fg(220)); // on pace -> yellow
+        assert_eq!(pace_color(10.0), fg(214)); // over -> orange
         assert_eq!(pace_color(34.0), fg(196)); // way over -> red
         assert_ne!(pace_color(-30.0), pace_color(30.0));
     }
