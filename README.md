@@ -99,15 +99,15 @@ Two lines under the prompt, split by domain — your **Claude session** on top,
 **this machine** below:
 
 ```
-Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% ⏳3h 54m | 7d 23% used · 5% over pace (8h24m) · ⏳5d 17h | 4h 31m · $2.74
-CPU 10% · RAM 56% · VM 62% · 🏠 my-mac | mydir | v26.07.05 | claude --resume <sid>
+Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M ( 12.7%) | 5h   9% ⏳3h 54m | 7d  23% used ·  5% over pace ( 8h24m) · ⏳5d 17h | 4h 31m · $2.74
+CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.10.20.2 | claude --resume <sid>
 ```
 
 On an SSH session the host segment turns orange and switches icon, so the whole
 bottom line reads as "the box this session is really on":
 
 ```
-CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude --resume <sid>
+CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.2 | claude --resume <sid>
 ```
 
 - **Line 1 — Claude session**: model, effort, thinking toggle, context gauge,
@@ -125,6 +125,54 @@ CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude -
 
 All stats come from direct syscalls (macOS `mach`/`sysctl`, Linux `/proc`,
 Windows `kernel32`) — no subprocesses, ~2–5 ms per refresh.
+
+The host turns 🌐 when the shell descends from `sshd`/`mosh-server`/an SSM
+session or the box is an EC2 instance (DMI vendor or the default `ip-A-B-C-D`
+hostname), so a tmux server or service manager that dropped the `SSH_*`
+variables doesn't make a remote box look local.
+
+### Glyphs: emoji or plain ASCII (garbled / shifting text)
+
+On an old Ubuntu (18.04 and earlier: glibc with Unicode 10 tables) a terminal,
+or a tmux/screen/mosh layer in front of it, doesn't know the width of newer
+emoji such as 🟢 (Unicode 12, 2019). Claude Code counts it as 2 columns, that
+layer as 1, so everything after it sits one column off — and because only the
+digits that changed get repainted each second, old digits stay behind: `11%`
+turns into `114`, `(13.6%)` into `(13648)`.
+
+The default glyph mode, `auto`, switches to plain ASCII where that is known to
+happen: a non-UTF-8 locale, `TERM=linux`/`dumb`, the legacy Windows console, or
+a Linux box whose libc `wcwidth()` doesn't report these emoji as 2 columns while
+a local terminal or tmux/screen/mosh on that box re-measures the line. It can't
+see a terminal program at the far end of an SSH connection, so if the line still
+garbles, force it by appending `--ascii` to the command in `settings.json` (or
+set `STATUSLINE_GLYPHS=ascii`); `--unicode` forces the emoji set.
+
+```json
+"statusLine": { "type": "command", "command": "$HOME/.claude/statusline-rs --ascii", "refreshInterval": 1 }
+```
+
+Windows: `"command": "\"C:/Users/you/.claude/statusline-rs.exe\" --ascii"`.
+
+| unicode | ASCII |
+|---|---|
+| `🟢 █░░░░░░░░░` context gauge (🟢 ⚡ 🔥 🚨 by fill) | `[#.........]`, same colors; `!!` only in the alarm state |
+| `⚡max` effort | `eff max` |
+| `⏳3d 14h` reset countdown | `~3d 14h` |
+| `🏠 host` / `🌐 host` | `@host` / `ssh:host` |
+| `·` within a sector | `,` |
+
+```
+Fable 5.1, eff max, think on | [#.........] 136.8K/1M ( 13.6%) | 5h  11% ~0h 42m | 7d  33% used, 15% under pace (23h31m), ~3d 14h | 23h 13m, $539.75
+CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.10.20.2 | claude --resume <sid>
+```
+
+**Every value that changes between refreshes has a fixed width**, in both
+modes: percentages are right-aligned to three digits (`  4%`, ` 14%`, `100%`),
+token counts to six characters (` 12.3K`, `136.8K`, ` 1.02M`), spans to six
+(`0h 42m`, `3d 14h`, `( 8h24m)`). A number growing a digit no longer pushes the
+rest of the line along, and a cell-diffing layer repaints only the digits that
+changed.
 
 ---
 

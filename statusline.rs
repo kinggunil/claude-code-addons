@@ -22,6 +22,17 @@
 // Single static binary, no interpreter startup, ~1-2 MB RSS.
 // Compile-time type checks + built-in unit tests (see mod tests at the bottom).
 //
+// Glyphs: emoji + block characters by default. `--ascii` (or STATUSLINE_GLYPHS=ascii)
+//   swaps every non-ASCII character for a plain one; the default `auto` does that
+//   by itself where emoji widths are known to be mis-measured: a non-UTF-8 locale,
+//   TERM=linux/dumb, the legacy Windows console, or a Linux box whose libc
+//   wcwidth() tables predate these emoji while a local terminal or tmux/screen/mosh
+//   on that box re-measures the line (a one-column disagreement after a glyph plus
+//   cell-level redraws leaves stale digits behind every refresh).
+// Every changing field is fixed-width ("  4%", "0h 42m", "136.8K", " 1d06h") so
+//   the line never shifts as numbers grow, and a cell-diffing layer repaints only
+//   the digits that changed.
+//
 // CPU% is the average load since the previous refresh: cumulative kernel counters
 // are cached in ~/.claude/.statusline-cpu.json. First run falls back to a 0.1 s
 // inline sample. Counters reset on reboot are detected and discarded.
@@ -44,7 +55,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.10.20";
+const VERSION: &str = "26.10.20.2";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -104,6 +115,317 @@ fn ctx_emoji(p: f64) -> &'static str {
 
 fn clip(v: f64) -> f64 {
     v.max(0.0).min(100.0)
+}
+
+// ---------------- glyph set: emoji vs plain ASCII ----------------
+
+/// Every non-ASCII character the status line can print is chosen here, so one
+/// switch replaces them all. The ASCII set exists because a terminal, or a
+/// tmux/screen/mosh layer in front of it, that measures an emoji as 1 column
+/// while it is drawn 2 wide shifts the rest of the line, and a cell-level redraw
+/// then leaves stale digits behind on every refresh (old Ubuntu: glibc 2.27 has
+/// Unicode 10 tables; 🟢 is Unicode 12). Colors are identical in both sets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Glyphs {
+    ascii: bool,
+}
+
+impl Glyphs {
+    const UNICODE: Glyphs = Glyphs { ascii: false };
+    const ASCII: Glyphs = Glyphs { ascii: true };
+
+    /// Within-sector separator, colored: " · " or ", ".
+    fn dot(&self) -> String {
+        if self.ascii {
+            format!("{},{} ", C_SEP, RESET)
+        } else {
+            format!(" {}·{} ", C_SEP, RESET)
+        }
+    }
+
+    /// Marks a reset countdown: "⏳3d 14h" / "~3d 14h".
+    fn hourglass(&self) -> &'static str {
+        if self.ascii {
+            "~"
+        } else {
+            "⏳"
+        }
+    }
+
+    /// Gauge cells (filled, empty) and the frame drawn around them.
+    fn bar_cells(&self) -> (&'static str, &'static str) {
+        if self.ascii {
+            ("#", ".")
+        } else {
+            ("█", "░")
+        }
+    }
+
+    fn bar_frame(&self) -> (&'static str, &'static str) {
+        if self.ascii {
+            ("[", "]")
+        } else {
+            ("", "")
+        }
+    }
+
+    /// Context-state marker in front of the gauge, trailing space included. The
+    /// gauge color already says ok/warm/hot, so ASCII only flags the alarm state.
+    fn ctx_marker(&self, pct: f64, alarm: bool) -> String {
+        if self.ascii {
+            if alarm || pct >= 90.0 {
+                "!! ".to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            format!("{} ", if alarm { "🚨" } else { ctx_emoji(pct) })
+        }
+    }
+
+    fn effort(&self, level: &str) -> String {
+        if self.ascii {
+            format!("eff {}", level)
+        } else {
+            format!("⚡{}", level)
+        }
+    }
+
+    /// Host segment: local 🏠 / "@", remote 🌐 / "ssh:".
+    fn host(&self, name: &str, remote: bool) -> String {
+        match (self.ascii, remote) {
+            (true, true) => format!("ssh:{}", name),
+            (true, false) => format!("@{}", name),
+            (false, true) => format!("🌐 {}", name),
+            (false, false) => format!("🏠 {}", name),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GlyphMode {
+    Auto,
+    Unicode,
+    Ascii,
+}
+
+/// `--ascii` / `--unicode` / `--glyphs=auto|ascii|unicode` on the command line,
+/// else STATUSLINE_GLYPHS, else auto. Unknown arguments are ignored.
+fn glyph_mode_from<I: IntoIterator<Item = String>>(args: I, env: Option<&str>) -> GlyphMode {
+    fn parse_mode(s: &str) -> Option<GlyphMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ascii" | "plain" => Some(GlyphMode::Ascii),
+            "unicode" | "emoji" => Some(GlyphMode::Unicode),
+            "auto" => Some(GlyphMode::Auto),
+            _ => None,
+        }
+    }
+    let mut mode = env.and_then(parse_mode);
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        let m = match a.as_str() {
+            "--ascii" => Some(GlyphMode::Ascii),
+            "--unicode" | "--emoji" => Some(GlyphMode::Unicode),
+            "--glyphs" => args.next().as_deref().and_then(parse_mode),
+            s => s.strip_prefix("--glyphs=").and_then(parse_mode),
+        };
+        if m.is_some() {
+            mode = m;
+        }
+    }
+    mode.unwrap_or(GlyphMode::Auto)
+}
+
+/// What `auto` looks at. Collected once per run; the pure `auto_ascii` decides.
+#[derive(Clone, Debug)]
+struct TermEnv {
+    windows: bool,
+    /// LC_ALL, else LC_CTYPE, else LANG (None when none is set)
+    lang: Option<String>,
+    term: String,
+    /// tmux/screen (env or ancestry) or mosh-server: something on this box
+    /// re-measures the line with this box's width tables
+    in_mux: bool,
+    remote: bool,
+    /// Some(true) when this box's libc wcwidth() agrees with how terminals draw
+    /// our glyphs; None where there is no libc to ask (Windows, macOS)
+    libc_ok: Option<bool>,
+    /// Windows: a terminal that renders emoji (Windows Terminal, VS Code, mintty, ...)
+    win_modern: bool,
+}
+
+fn env_set(key: &str) -> bool {
+    std::env::var_os(key).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+fn term_env(ancestors: &[String], host: Option<&str>) -> TermEnv {
+    let lang = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+    TermEnv {
+        windows: cfg!(windows),
+        lang,
+        term: std::env::var("TERM").unwrap_or_default(),
+        in_mux: in_mux(ancestors),
+        remote: is_remote(ancestors, host),
+        libc_ok: libc_widths_ok(),
+        win_modern: ["WT_SESSION", "TERM_PROGRAM", "WEZTERM_PANE", "ALACRITTY_WINDOW_ID"]
+            .iter()
+            .any(|k| env_set(k)),
+    }
+}
+
+/// The auto rule. Only this box can be inspected, so it is conservative: ASCII
+/// when something here is known to mis-measure, the emoji set otherwise.
+fn auto_ascii(e: &TermEnv) -> bool {
+    match &e.lang {
+        Some(l) => {
+            if !l.to_ascii_lowercase().replace('-', "").contains("utf8") {
+                return true; // C / POSIX / EUC-KR ...: can't even encode the glyphs
+            }
+        }
+        // tmux/screen treat input as non-UTF-8 without a locale; Windows rarely sets one
+        None if e.in_mux && !e.windows => return true,
+        None => {}
+    }
+    if e.windows {
+        return !e.win_modern; // the legacy console draws emoji badly
+    }
+    if matches!(e.term.as_str(), "dumb" | "linux" | "vt100" | "vt102" | "vt220") {
+        return true; // console / no emoji fonts
+    }
+    // A multiplexer here, or a local terminal on this box, measures with this
+    // box's libc tables; over plain SSH the far terminal decides and we can't see it.
+    (e.in_mux || !e.remote) && e.libc_ok == Some(false)
+}
+
+fn resolve_glyphs(mode: GlyphMode, ancestors: &[String], host: Option<&str>) -> Glyphs {
+    match mode {
+        GlyphMode::Ascii => Glyphs::ASCII,
+        GlyphMode::Unicode => Glyphs::UNICODE,
+        GlyphMode::Auto => {
+            if auto_ascii(&term_env(ancestors, host)) {
+                Glyphs::ASCII
+            } else {
+                Glyphs::UNICODE
+            }
+        }
+    }
+}
+
+/// Names of this process's ancestors ("bash", "node", "tmux: server",
+/// "sshd-session", ...), nearest first, read from /proc. Empty elsewhere.
+#[cfg(target_os = "linux")]
+fn ancestor_comms() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        let stat = match fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        // "<pid> (<comm>) <state> <ppid> ..." — comm may itself contain spaces or ')'
+        let (open, close) = match (stat.find('('), stat.rfind(')')) {
+            (Some(a), Some(b)) if b > a => (a, b),
+            _ => break,
+        };
+        out.push(stat[open + 1..close].to_string());
+        let ppid: u32 = stat[close + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        if ppid <= 1 {
+            break;
+        }
+        pid = ppid;
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ancestor_comms() -> Vec<String> {
+    Vec::new()
+}
+
+fn in_mux(ancestors: &[String]) -> bool {
+    env_set("TMUX")
+        || env_set("STY")
+        || ancestors.iter().any(|c| {
+            c.starts_with("tmux") || c.eq_ignore_ascii_case("screen") || c.starts_with("mosh-server")
+        })
+}
+
+/// SSH/mosh/SSM session, or a cloud VM nobody sits at (EC2 by DMI vendor or its
+/// default ip-A-B-C-D hostname): the box is remote even when a multiplexer or a
+/// service manager started the shell without the SSH_* variables.
+fn is_remote(ancestors: &[String], host: Option<&str>) -> bool {
+    if env_set("SSH_CONNECTION") || env_set("SSH_TTY") || env_set("SSH_CLIENT") {
+        return true;
+    }
+    if ancestors.iter().any(|c| {
+        c.starts_with("sshd") || c.starts_with("mosh-server") || c.starts_with("ssm-session")
+    }) {
+        return true;
+    }
+    host.map(is_ec2_hostname).unwrap_or(false) || dmi_says_ec2()
+}
+
+/// EC2's default hostname, "ip-172-31-16-160".
+fn is_ec2_hostname(h: &str) -> bool {
+    match h.strip_prefix("ip-") {
+        Some(rest) => {
+            let parts: Vec<&str> = rest.split('-').collect();
+            parts.len() == 4
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()))
+        }
+        None => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dmi_says_ec2() -> bool {
+    fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        .map(|v| v.contains("Amazon EC2"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dmi_says_ec2() -> bool {
+    false
+}
+
+/// Does this box's libc measure our glyphs the way modern terminals draw them
+/// (emoji 2 columns, block/dot 1)? None when there is nothing to ask.
+#[cfg(target_os = "linux")]
+fn libc_widths_ok() -> Option<bool> {
+    extern "C" {
+        fn setlocale(category: i32, locale: *const u8) -> *mut u8;
+        fn wcwidth(c: i32) -> i32;
+    }
+    const LC_CTYPE: i32 = 0;
+    // the environment's locale, else any UTF-8 one: the width table is per glibc
+    // version, not per locale, it only has to be a UTF-8 charmap
+    let locales: [&[u8]; 3] = [b"\0", b"C.UTF-8\0", b"en_US.UTF-8\0"];
+    let loaded = locales
+        .iter()
+        .any(|l| !unsafe { setlocale(LC_CTYPE, l.as_ptr()) }.is_null());
+    if !loaded {
+        return None;
+    }
+    let wide = [0x1F7E2, 0x23F3, 0x1F3E0, 0x1F310, 0x26A1, 0x1F525, 0x1F6A8]; // 🟢 ⏳ 🏠 🌐 ⚡ 🔥 🚨
+    let narrow = [0x2588, 0x2591, 0x00B7]; // █ ░ ·
+    Some(
+        wide.iter().all(|&c| unsafe { wcwidth(c) } == 2)
+            && narrow.iter().all(|&c| unsafe { wcwidth(c) } == 1),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn libc_widths_ok() -> Option<bool> {
+    None
 }
 
 // ---------------- minimal JSON ----------------
@@ -786,48 +1108,52 @@ fn cpu_percent() -> Option<f64> {
 
 // ---------------- formatting ----------------
 
+/// Fixed 6 characters, right-aligned: "   999", " 12.3K", "136.8K", " 1.02M".
 fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
+    let s = if n >= 999_950 {
         format!("{:.2}M", n as f64 / 1e6)
     } else if n >= 1000 {
         format!("{:.1}K", n as f64 / 1e3)
     } else {
         n.to_string()
-    }
+    };
+    format!("{:>6}", s)
 }
 
+/// "4h 31m", "0h 05m": minutes zero-padded, so the field is 6 characters until
+/// the hours reach two digits.
 fn fmt_duration(ms: f64) -> Option<String> {
     if ms <= 0.0 {
         return None;
     }
     let s = (ms / 1000.0) as u64;
-    let (h, m) = (s / 3600, (s % 3600) / 60);
-    Some(if h > 0 {
-        format!("{}h {}m", h, m)
-    } else {
-        format!("{}m", m)
-    })
+    Some(format!("{}h {:02}m", s / 3600, (s % 3600) / 60))
 }
 
-/// Right-pads single-digit percentages to a fixed 2-char field (" 4" vs "14")
-/// so a value crossing the 9%->10% boundary doesn't shift everything after it
-/// on the line every refresh.
+/// Percentages right-aligned to a fixed 3-char field ("  4", " 14", "100") so a
+/// value crossing a digit boundary doesn't shift everything after it on the line.
 fn fmt_pct(v: f64) -> String {
-    format!("{:>2.0}", v)
+    format!("{:>3.0}", v)
 }
 
-/// e.g. "5h 23%(4h12m)" — reset countdown omitted when resets_at/now is unavailable
-/// or already in the past (clock skew / stale sample). `pct` is clipped to
-/// 0-100 defensively since it comes straight from the harness JSON, not a
-/// locally-computed value.
-fn rate_limit_segment(label: &str, pct: f64, resets_at: Option<f64>, now: Option<f64>) -> String {
+/// e.g. "5h  23% ⏳4h 12m" — reset countdown omitted when resets_at/now is
+/// unavailable or already in the past (clock skew / stale sample). `pct` is
+/// clipped to 0-100 defensively since it comes straight from the harness JSON,
+/// not a locally-computed value.
+fn rate_limit_segment(
+    label: &str,
+    pct: f64,
+    resets_at: Option<f64>,
+    now: Option<f64>,
+    g: &Glyphs,
+) -> String {
     let pct = clip(pct);
     let mut seg = format!("{} {}{}%{}", label, color_for_pct(pct), fmt_pct(pct), RESET);
     if let (Some(r), Some(n)) = (resets_at, now) {
         if r > n {
             if let Some(rem) = fmt_duration((r - n) * 1000.0) {
                 // ⏳ marks the reset countdown, matching the 7d segment
-                seg.push_str(&format!(" {}⏳{}{}", C_OFF, rem, RESET));
+                seg.push_str(&format!(" {}{}{}{}", C_OFF, g.hourglass(), rem, RESET));
             }
         }
     }
@@ -856,24 +1182,18 @@ fn week_elapsed_secs(resets_at: Option<f64>, now: f64) -> f64 {
     }
 }
 
-/// "Xd Yh" / "Xh Ym" / "Xm" — day-aware span for the weekly reset countdown.
+/// "3d 14h", "0d 05h" — fixed 6-character span for the weekly reset countdown
+/// (hour resolution: it counts down a week).
 fn fmt_span(secs: f64) -> Option<String> {
     if secs <= 0.0 {
         return None;
     }
     let s = secs as u64;
-    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
-    Some(if d > 0 {
-        format!("{}d {}h", d, h)
-    } else if h > 0 {
-        format!("{}h {}m", h, m)
-    } else {
-        format!("{}m", m)
-    })
+    Some(format!("{}d {:02}h", s / 86_400, (s % 86_400) / 3600))
 }
 
-/// Compact, space-free span ("8h24m", "2d16h", "45m") for inline annotations
-/// where a space would visually split the value from the token before it.
+/// Compact span for inline annotations, fixed 6 characters: " 8h24m", " 2d16h".
+/// No inner space, so the value doesn't visually split from the token before it.
 fn fmt_span_compact(secs: f64) -> Option<String> {
     if secs <= 0.0 {
         return None;
@@ -881,11 +1201,9 @@ fn fmt_span_compact(secs: f64) -> Option<String> {
     let s = secs as u64;
     let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
     Some(if d > 0 {
-        format!("{}d{}h", d, h)
-    } else if h > 0 {
-        format!("{}h{}m", h, m)
+        format!("{:>2}d{:02}h", d, h)
     } else {
-        format!("{}m", m)
+        format!("{:>2}h{:02}m", h, m)
     })
 }
 
@@ -936,9 +1254,11 @@ fn pace_time(delta: f64) -> Option<String> {
 /// "N% under pace" headroom / "on pace"), annotated with that same gap re-expressed
 /// as time in parens, colored by headroom (used - elapsed); then the reset countdown
 /// behind an ⏳. Without rate-limit data, just the week time-progress.
-///   with usage: "7d 39% used · 18% over pace (1d6h) · ⏳5d12h"
-///   time only:  "wk 21% · ⏳5d12h"
-fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64) -> String {
+///   with usage: "7d  39% used · 18% over pace ( 1d06h) · ⏳5d 12h"
+///   time only:  "wk  21% · ⏳5d 12h"
+/// Every number is fixed-width so the segment only changes length when the pace
+/// flips between over/under/on.
+fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64, g: &Glyphs) -> String {
     let elapsed = week_elapsed_secs(resets_at, now);
     let elapsed_pct = clip(elapsed / WEEK_SECS * 100.0);
     let countdown = fmt_span(WEEK_SECS - elapsed);
@@ -953,30 +1273,36 @@ fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64) -> String
             .map(|t| format!(" ({})", t))
             .unwrap_or_default();
         let pace = if d > 0 {
-            format!("{}{}% over pace{}{}", col, d, t, RESET)
+            format!("{}{:>2}% over pace{}{}", col, d, t, RESET)
         } else if d < 0 {
-            format!("{}{}% under pace{}{}", col, -d, t, RESET)
+            format!("{}{:>2}% under pace{}{}", col, -d, t, RESET)
         } else {
             format!("{}on pace{}", col, RESET)
         };
-        format!("7d {:.0}% used {}·{} {}", u, C_SEP, RESET, pace)
+        format!("7d {}% used{}{}", fmt_pct(u), g.dot(), pace)
     } else {
         format!("{}wk {}%{}", C_OFF, fmt_pct(elapsed_pct), RESET)
     };
     if let Some(c) = countdown {
-        seg.push_str(&format!(" {}·{} {}⏳{}{}", C_SEP, RESET, C_OFF, c, RESET));
+        seg.push_str(&format!("{}{}{}{}{}", g.dot(), C_OFF, g.hourglass(), c, RESET));
     }
     seg
 }
 
-fn bar(pct: f64, width: usize) -> String {
+fn bar(pct: f64, width: usize, g: &Glyphs) -> String {
     let filled = ((pct / 100.0 * width as f64).round() as i64).clamp(0, width as i64) as usize;
+    let (full, empty) = g.bar_cells();
+    let (open, close) = g.bar_frame();
     format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}",
+        C_SEP,
+        open,
         color_for_pct(pct),
-        "█".repeat(filled),
+        full.repeat(filled),
         C_OFF,
-        "░".repeat(width - filled),
+        empty.repeat(width - filled),
+        C_SEP,
+        close,
         RESET
     )
 }
@@ -984,6 +1310,17 @@ fn bar(pct: f64, width: usize) -> String {
 // ---------------- main ----------------
 
 fn main() {
+    let ancestors = ancestor_comms();
+    let host = hostname();
+    let g = resolve_glyphs(
+        glyph_mode_from(
+            std::env::args().skip(1),
+            std::env::var("STATUSLINE_GLYPHS").ok().as_deref(),
+        ),
+        &ancestors,
+        host.as_deref(),
+    );
+
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
     let d = match parse(input.trim()) {
@@ -1112,7 +1449,7 @@ fn main() {
         .unwrap_or(false);
 
     let sep = format!(" {}|{} ", C_SEP, RESET); // between sectors
-    let dot = format!(" {}·{} ", C_SEP, RESET); // within a sector (line 2)
+    let dot = g.dot(); // within a sector
 
     // ---- line 1 (dim): [spend: elapsed · cost] | [5h] | [7d] | [resume] ----
     // ordered by glance-frequency: budget first, the rarely-read resume id last.
@@ -1129,13 +1466,13 @@ fn main() {
     if let Some(rl) = d.get("rate_limits") {
         if let Some(pct) = rl.path(&["five_hour", "used_percentage"]).and_then(Json::as_f64) {
             let resets_at = rl.path(&["five_hour", "resets_at"]).and_then(Json::as_f64);
-            meta.push(rate_limit_segment("5h", pct, resets_at, now));
+            meta.push(rate_limit_segment("5h", pct, resets_at, now, &g));
         }
         seven_used = rl.path(&["seven_day", "used_percentage"]).and_then(Json::as_f64);
         seven_reset = rl.path(&["seven_day", "resets_at"]).and_then(Json::as_f64);
     }
     if let Some(n) = now {
-        meta.push(weekly_segment(seven_used, seven_reset, n));
+        meta.push(weekly_segment(seven_used, seven_reset, n, &g));
     }
 
     // lower priority: elapsed · cost — demoted to the right, plain dim (cost is an
@@ -1148,7 +1485,7 @@ fn main() {
         spend.push(format!("${:.2}", cost_usd));
     }
     if !spend.is_empty() {
-        meta.push(spend.join(" · "));
+        meta.push(spend.join(&dot));
     }
 
 
@@ -1162,7 +1499,7 @@ fn main() {
     // drop the verbose " context" suffix (e.g. "Opus 4.8 (1M context)" -> "(1M)")
     mode.push(format!("{}{}{}{}", BOLD, C_MODEL, model.replace(" context", ""), RESET));
     if !effort.is_empty() {
-        mode.push(format!("{}⚡{}{}", color_for_effort(effort), effort, RESET));
+        mode.push(format!("{}{}{}", color_for_effort(effort), g.effort(effort), RESET));
     }
     mode.push(if thinking {
         format!("{}think on{}", C_ON, RESET)
@@ -1180,15 +1517,11 @@ fn main() {
             0.0
         };
         let col = color_for_pct(pct);
-        let emo = if exceeds_200k && max_ctx <= 200_000 {
-            "🚨"
-        } else {
-            ctx_emoji(pct)
-        };
+        let marker = g.ctx_marker(pct, exceeds_200k && max_ctx <= 200_000);
         claude.push(format!(
-            "{} {} {}{}/{} ({:.1}%){}",
-            emo,
-            bar(pct, 10),
+            "{}{} {}{}/{} ({:>5.1}%){}",
+            marker,
+            bar(pct, 10, &g),
             col,
             fmt_tokens(ctx_tokens),
             max_label,
@@ -1216,14 +1549,10 @@ fn main() {
             machine.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
         }
     }
-    if let Some(h) = hostname() {
-        let is_ssh = std::env::var_os("SSH_CONNECTION").is_some()
-            || std::env::var_os("SSH_TTY").is_some();
-        if is_ssh {
-            machine.push(format!("{}🌐 {}{}", fg(214), h, RESET));
-        } else {
-            machine.push(format!("{}🏠 {}{}", C_HOST, h, RESET));
-        }
+    if let Some(h) = &host {
+        let remote = is_remote(&ancestors, Some(h.as_str()));
+        let hc = if remote { fg(214) } else { C_HOST.to_string() };
+        machine.push(format!("{}{}{}", hc, g.host(h, remote), RESET));
     }
     if !machine.is_empty() {
         local.push(machine.join(&dot));
@@ -1303,15 +1632,17 @@ mod tests {
 
     #[test]
     fn token_units() {
-        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(999), "   999");
         assert_eq!(fmt_tokens(126_510), "126.5K");
-        assert_eq!(fmt_tokens(4_457_100), "4.46M");
+        assert_eq!(fmt_tokens(999_949), "999.9K");
+        assert_eq!(fmt_tokens(999_950), " 1.00M"); // never "1000.0K"
+        assert_eq!(fmt_tokens(4_457_100), " 4.46M");
     }
 
     #[test]
     fn duration_units() {
         assert_eq!(fmt_duration(16_260_000.0), Some("4h 31m".to_string()));
-        assert_eq!(fmt_duration(60_000.0), Some("1m".to_string()));
+        assert_eq!(fmt_duration(60_000.0), Some("0h 01m".to_string()));
         assert_eq!(fmt_duration(0.0), None);
         assert_eq!(fmt_duration(-5.0), None);
     }
@@ -1319,13 +1650,16 @@ mod tests {
     #[test]
     fn bar_always_ten_cells() {
         for pct in [0.0, 12.7, 45.0, 99.9, 100.0, 250.0] {
-            let b = bar(pct, 10);
+            let b = bar(pct, 10, &Glyphs::UNICODE);
             assert_eq!(
                 b.matches('█').count() + b.matches('░').count(),
                 10,
                 "pct={}",
                 pct
             );
+            let a = visible(&bar(pct, 10, &Glyphs::ASCII));
+            assert_eq!(a.matches('#').count() + a.matches('.').count(), 10, "pct={}", pct);
+            assert!(a.starts_with('[') && a.ends_with(']'), "{}", a);
         }
     }
 
@@ -1349,22 +1683,25 @@ mod tests {
 
     #[test]
     fn fmt_pct_pads_single_digit_to_match_double_digit_width() {
-        assert_eq!(fmt_pct(4.0), " 4");
-        assert_eq!(fmt_pct(14.0), "14");
-        assert_eq!(fmt_pct(100.0), "100"); // rare edge case, allowed to widen
+        assert_eq!(fmt_pct(4.0), "  4");
+        assert_eq!(fmt_pct(14.0), " 14");
+        assert_eq!(fmt_pct(100.0), "100"); // reserved: 100% never widens the field
     }
 
     #[test]
     fn rate_limit_segment_with_reset() {
-        let s = rate_limit_segment("5h", 23.0, Some(2000.0), Some(1000.0));
+        let g = Glyphs::UNICODE;
+        let s = rate_limit_segment("5h", 23.0, Some(2000.0), Some(1000.0), &g);
         assert!(s.contains("5h"));
         assert!(s.contains("23%"));
-        assert!(s.contains("16m")); // (2000-1000)s = 1000s = 16m
+        assert!(s.contains("⏳0h 16m")); // (2000-1000)s = 1000s = 16m
+        let a = rate_limit_segment("5h", 23.0, Some(2000.0), Some(1000.0), &Glyphs::ASCII);
+        assert!(a.contains("~0h 16m"));
     }
 
     #[test]
     fn rate_limit_segment_no_reset_info() {
-        let s = rate_limit_segment("7d", 41.0, None, None);
+        let s = rate_limit_segment("7d", 41.0, None, None, &Glyphs::UNICODE);
         assert!(s.contains("7d"));
         assert!(s.contains("41%"));
         assert!(!s.contains('⏳')); // no countdown when resets_at/now missing
@@ -1374,15 +1711,16 @@ mod tests {
     fn rate_limit_segment_clips_out_of_range_pct() {
         // defensive: this comes straight from harness JSON, not a locally
         // computed/bounded value, so malformed input shouldn't render garbage
-        assert!(rate_limit_segment("5h", 150.0, None, None).contains("100%"));
-        assert!(rate_limit_segment("5h", -20.0, None, None).contains(" 0%"));
+        let g = Glyphs::UNICODE;
+        assert!(rate_limit_segment("5h", 150.0, None, None, &g).contains("100%"));
+        assert!(rate_limit_segment("5h", -20.0, None, None, &g).contains("  0%"));
     }
 
     #[test]
     fn rate_limit_segment_past_reset_omitted() {
         // resets_at already elapsed (stale/clock skew) — no countdown, no panic
-        let s = rate_limit_segment("5h", 90.0, Some(500.0), Some(1000.0));
-        assert!(!s.contains('('));
+        let s = rate_limit_segment("5h", 90.0, Some(500.0), Some(1000.0), &Glyphs::UNICODE);
+        assert!(!s.contains('⏳'));
     }
 
     #[test]
@@ -1446,9 +1784,9 @@ mod tests {
     #[test]
     fn fmt_span_units() {
         assert_eq!(fmt_span(0.0), None);
-        assert_eq!(fmt_span(90_000.0), Some("1d 1h".to_string()));
-        assert_eq!(fmt_span(3_660.0), Some("1h 1m".to_string()));
-        assert_eq!(fmt_span(120.0), Some("2m".to_string()));
+        assert_eq!(fmt_span(90_000.0), Some("1d 01h".to_string()));
+        assert_eq!(fmt_span(3_660.0), Some("0d 01h".to_string()));
+        assert_eq!(fmt_span(120.0), Some("0d 00h".to_string()));
     }
 
     #[test]
@@ -1462,19 +1800,19 @@ mod tests {
     #[test]
     fn fmt_span_compact_units() {
         assert_eq!(fmt_span_compact(0.0), None);
-        assert_eq!(fmt_span_compact(90_000.0), Some("1d1h".to_string()));
-        assert_eq!(fmt_span_compact(3_660.0), Some("1h1m".to_string()));
-        assert_eq!(fmt_span_compact(120.0), Some("2m".to_string()));
-        assert_eq!(fmt_span_compact(30_240.0), Some("8h24m".to_string()));
+        assert_eq!(fmt_span_compact(90_000.0), Some(" 1d01h".to_string()));
+        assert_eq!(fmt_span_compact(3_660.0), Some(" 1h01m".to_string()));
+        assert_eq!(fmt_span_compact(120.0), Some(" 0h02m".to_string()));
+        assert_eq!(fmt_span_compact(30_240.0), Some(" 8h24m".to_string()));
     }
 
     #[test]
     fn pace_time_converts_delta_to_span() {
         // 1pp == 1% of a week; +5pp -> 5% of 604800s == 8h24m, sign-independent
-        assert_eq!(pace_time(5.0), Some("8h24m".to_string()));
-        assert_eq!(pace_time(-5.0), Some("8h24m".to_string()));
+        assert_eq!(pace_time(5.0), Some(" 8h24m".to_string()));
+        assert_eq!(pace_time(-5.0), Some(" 8h24m".to_string()));
         // multi-day offset for a large delta
-        assert_eq!(pace_time(40.0), Some("2d19h".to_string()));
+        assert_eq!(pace_time(40.0), Some(" 2d19h".to_string()));
         // rounds to 0% -> on pace -> no time shown
         assert_eq!(pace_time(0.4), None);
         assert_eq!(pace_time(-0.3), None);
@@ -1484,16 +1822,146 @@ mod tests {
     fn weekly_segment_with_and_without_usage() {
         // used 12%, resets in 6 days -> ~1 day (~14%) of the week elapsed ->
         // "12% used", 2% under pace, that gap re-expressed as ~3h21m of headroom
-        let s = weekly_segment(Some(12.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0);
+        let g = Glyphs::UNICODE;
+        let s = weekly_segment(Some(12.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0, &g);
         assert!(s.contains("7d"));
-        assert!(s.contains("12% used"));
-        assert!(s.contains("2% under pace"));
-        assert!(s.contains("3h21m")); // gap re-expressed as time
-        assert!(s.contains('⏳')); // reset countdown marker
+        assert!(s.contains(" 12% used"));
+        assert!(s.contains(" 2% under pace"));
+        assert!(s.contains("( 3h21m)")); // gap re-expressed as time
+        assert!(s.contains("⏳6d 00h")); // reset countdown marker
         assert!(!s.contains("wk")); // usage mode has no wk label
-        let t = weekly_segment(None, None, WEEK_ANCHOR + 86_400.0);
+        let t = weekly_segment(None, None, WEEK_ANCHOR + 86_400.0, &g);
         assert!(t.contains("wk"));
         assert!(t.contains('⏳'));
         assert!(!t.contains("7d"));
+    }
+
+    /// The text a terminal shows: the same string with the ANSI color codes removed.
+    fn visible(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn glyph_mode_parsing() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(glyph_mode_from(a(&[]), None), GlyphMode::Auto);
+        assert_eq!(glyph_mode_from(a(&["--ascii"]), None), GlyphMode::Ascii);
+        assert_eq!(glyph_mode_from(a(&["--glyphs", "ascii"]), None), GlyphMode::Ascii);
+        // a flag beats the environment, the environment beats the default
+        assert_eq!(glyph_mode_from(a(&["--glyphs=unicode"]), Some("ascii")), GlyphMode::Unicode);
+        assert_eq!(glyph_mode_from(a(&["--bogus"]), Some("ASCII")), GlyphMode::Ascii);
+        assert_eq!(glyph_mode_from(a(&[]), Some("nonsense")), GlyphMode::Auto);
+    }
+
+    #[test]
+    fn auto_ascii_rules() {
+        let good = TermEnv {
+            windows: false,
+            lang: Some("en_US.UTF-8".to_string()),
+            term: "xterm-256color".to_string(),
+            in_mux: false,
+            remote: true,
+            libc_ok: Some(true),
+            win_modern: false,
+        };
+        assert!(!auto_ascii(&good));
+        assert!(auto_ascii(&TermEnv { lang: Some("C".to_string()), ..good.clone() }));
+        assert!(auto_ascii(&TermEnv { lang: Some("ko_KR.EUC-KR".to_string()), ..good.clone() }));
+        assert!(!auto_ascii(&TermEnv { lang: Some("ko_KR.utf8".to_string()), ..good.clone() }));
+        assert!(auto_ascii(&TermEnv { term: "linux".to_string(), ..good.clone() }));
+        // old libc tables matter only when something on this box re-measures the line
+        assert!(!auto_ascii(&TermEnv { libc_ok: Some(false), ..good.clone() })); // plain SSH
+        assert!(auto_ascii(&TermEnv { libc_ok: Some(false), in_mux: true, ..good.clone() })); // tmux here
+        assert!(auto_ascii(&TermEnv { libc_ok: Some(false), remote: false, ..good.clone() })); // local terminal
+        assert!(!auto_ascii(&TermEnv { libc_ok: None, in_mux: true, ..good.clone() })); // nothing to go on
+        assert!(auto_ascii(&TermEnv { lang: None, in_mux: true, ..good.clone() }));
+        assert!(!auto_ascii(&TermEnv { lang: None, ..good.clone() }));
+        let win = TermEnv { windows: true, win_modern: true, ..good.clone() };
+        assert!(!auto_ascii(&win));
+        assert!(!auto_ascii(&TermEnv { lang: None, ..win.clone() })); // LANG is rarely set on Windows
+        assert!(auto_ascii(&TermEnv { lang: Some("C".to_string()), ..win.clone() })); // but an explicit non-UTF-8 one counts
+        assert!(auto_ascii(&TermEnv { win_modern: false, ..win }));
+    }
+
+    #[test]
+    fn remote_detection_without_ssh_variables() {
+        assert!(is_ec2_hostname("ip-172-31-16-160"));
+        assert!(!is_ec2_hostname("ip-172-31-16"));
+        assert!(!is_ec2_hostname("my-mac"));
+        assert!(!is_ec2_hostname("ip-1234-1-1-1"));
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // ancestry is consulted even with no SSH_* in the environment of a test run
+        assert!(is_remote(&v(&["statusline-rs", "bash", "node", "bash", "sshd-session"]), Some("box")));
+        assert!(is_remote(&v(&["statusline-rs", "bash", "node", "zsh", "mosh-server"]), Some("box")));
+        assert!(in_mux(&v(&["statusline-rs", "bash", "node", "bash", "tmux: server"])));
+        assert!(in_mux(&v(&["statusline-rs", "sh", "SCREEN"])));
+        assert!(!in_mux(&v(&["statusline-rs", "bash", "node", "bash", "sshd-session"])) || env_set("TMUX") || env_set("STY"));
+    }
+
+    #[test]
+    fn ascii_mode_prints_only_ascii() {
+        let g = Glyphs::ASCII;
+        let mut all = String::new();
+        all.push_str(&rate_limit_segment("5h", 23.0, Some(2000.0), Some(1000.0), &g));
+        all.push_str(&weekly_segment(Some(12.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0, &g));
+        all.push_str(&weekly_segment(Some(73.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0, &g));
+        all.push_str(&weekly_segment(None, None, WEEK_ANCHOR + 86_400.0, &g));
+        all.push_str(&bar(37.0, 10, &g));
+        all.push_str(&g.ctx_marker(95.0, true));
+        all.push_str(&g.ctx_marker(10.0, false));
+        all.push_str(&g.effort("max"));
+        all.push_str(&g.host("ip-172-31-16-160", true));
+        all.push_str(&g.host("mac", false));
+        all.push_str(&g.dot());
+        all.push_str(g.hourglass());
+        assert!(all.is_ascii(), "{:?}", all);
+        // and the unicode set still carries the glyphs
+        assert!(bar(37.0, 10, &Glyphs::UNICODE).contains('█'));
+        assert!(Glyphs::UNICODE.host("x", true).contains('🌐'));
+        assert!(Glyphs::UNICODE.ctx_marker(10.0, false).contains('🟢'));
+    }
+
+    #[test]
+    fn changing_fields_keep_their_width() {
+        // every value that moves between refreshes renders at one width, so nothing
+        // after it on the line shifts, and a cell-diffing layer repaints only digits
+        let w = |s: String| visible(&s).chars().count();
+        for v in [0.0, 4.0, 14.0, 99.0, 100.0] {
+            assert_eq!(fmt_pct(v).len(), 3, "pct {}", v);
+        }
+        for n in [0, 999, 1_000, 12_345, 136_779, 999_949, 1_020_000, 9_999_999] {
+            assert_eq!(fmt_tokens(n).len(), 6, "tokens {}", n);
+        }
+        for ms in [60_000.0, 2_520_000.0, 16_260_000.0, 5.0 * 3_600_000.0] {
+            assert_eq!(fmt_duration(ms).unwrap().len(), 6, "duration {}", ms);
+        }
+        for s in [120.0, 3_660.0, 90_000.0, 6.9 * 86_400.0] {
+            assert_eq!(fmt_span(s).unwrap().len(), 6, "span {}", s);
+            assert_eq!(fmt_span_compact(s).unwrap().len(), 6, "compact {}", s);
+        }
+        for g in [Glyphs::UNICODE, Glyphs::ASCII] {
+            // 16 minutes vs 4h12m left, 4% vs 44% used
+            let a = w(rate_limit_segment("5h", 4.0, Some(1960.0), Some(1000.0), &g));
+            let b = w(rate_limit_segment("5h", 44.0, Some(16_120.0), Some(1000.0), &g));
+            assert_eq!(a, b);
+            // both under pace: 12% used after 1 day vs 3% used after half a day
+            let c = w(weekly_segment(Some(12.0), Some(1000.0 + 6.0 * 86_400.0), 1000.0, &g));
+            let d = w(weekly_segment(Some(3.0), Some(1000.0 + 6.5 * 86_400.0), 1000.0, &g));
+            assert_eq!(c, d);
+            assert_eq!(w(bar(0.0, 10, &g)), w(bar(100.0, 10, &g)));
+        }
     }
 }

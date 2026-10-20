@@ -3,6 +3,7 @@
 
   "_A_addon": "===== (A) claude-code-addons — the installer (install.sh / install.ps1) merges THESE into your real settings.json automatically; you don't add them by hand =====",
   "_A_paths": "Paths below use the macOS/Linux form: $HOME/.claude + no file extension. On Windows the installer writes a QUOTED forward-slash path with .exe instead, e.g. \"C:/Users/you/.claude/statusline-rs.exe\" — Claude Code runs these commands through Git Bash, which drops unquoted backslashes, so C:\\Users\\you\\... would silently fail (command not found, status line never shows).",
+  "_A_ascii": "Status line garbled or shifting on an old terminal / tmux / mosh? Append --ascii to the statusLine command (e.g. \"$HOME/.claude/statusline-rs --ascii\"): every emoji and block character becomes plain ASCII. The default is auto-detection; see README.",
   "statusLine": {
     "type": "command",
     "command": "$HOME/.claude/statusline-rs",

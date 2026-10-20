@@ -68,20 +68,49 @@ Claude Code는 모르는 키를 무시합니다.)
 프롬프트 아래 2줄, **도메인 기준으로 분리** — 위는 **내 Claude 세션**, 아래는 **이 머신**:
 
 ```
-Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M (12.7%) | 5h  9% ⏳3h 54m | 7d 23% used · 5% over pace (8h24m) · ⏳5d 17h | 4h 31m · $2.74
-CPU 10% · RAM 56% · VM 62% · 🏠 my-mac | mydir | v26.07.05 | claude --resume <sid>
+Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M ( 12.7%) | 5h   9% ⏳3h 54m | 7d  23% used ·  5% over pace ( 8h24m) · ⏳5d 17h | 4h 31m · $2.74
+CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.10.20.2 | claude --resume <sid>
 ```
 
 SSH 세션에서는 호스트 세그먼트가 주황색 🌐로 바뀌어, 아랫줄 전체가 "이 세션이 실제로 도는 박스"처럼 읽힙니다:
 
 ```
-CPU 10% · RAM 56% · VM  0% · 🌐 ip-10-0-1-23 | mydir | v26.07.05 | claude --resume <sid>
+CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.2 | claude --resume <sid>
 ```
 
 - **1줄 — Claude 세션**: 모델, effort, thinking 토글, 컨텍스트 게이지, 그다음 Claude.ai 사용량 한도(Pro/Max) — 각 창은 `사용%` 와 `⏳` 뒤의 리셋 카운트다운으로 표시. 7일 창은 여기에 **주간 페이스**를 쉬운 말로 덧붙입니다: `N% over pace`(균등 리셋 기준선보다 빠르게 소비) 또는 `N% under pace`(여유), 여유량에 따라 색이 바뀌고 그 차이를 시간으로도 함께 표기. 이어서 경과 시간과 비용.
 - **2줄 — 이 머신**: CPU/RAM/VM을 맨 앞에(실시간으로 변하는 유일한 값이라 왼쪽 첫 자리에 배치), 그다음 머신 **호스트**(🏠 시안=로컬, 🌐 주황=SSH 원격 — 호스트명은 상태줄이 실행되는 머신에서 오므로 SSH에선 원격 서버 이름을 표시), 작업 디렉터리, `vYY.MM.DD` 빌드 태그(저장소 버전과 비교해 오래된 머신 파악), 그리고 맨 오른쪽에 전체 `claude --resume` 명령.
 
 모든 수치는 직접 시스템콜로 수집합니다(macOS `mach`/`sysctl`, Linux `/proc`, Windows `kernel32`) — 서브프로세스 없이 갱신당 ~2–5ms.
+
+호스트는 셸의 조상 프로세스에 `sshd`/`mosh-server`/SSM 세션이 있거나 그 머신이 EC2 인스턴스(DMI 제조사 또는 기본 호스트명 `ip-A-B-C-D`)이면 🌐로 표시됩니다. tmux 서버나 서비스 매니저가 `SSH_*` 변수를 떨어뜨려도 원격 박스가 로컬처럼 보이지 않습니다.
+
+### 글자가 밀리거나 깨질 때 — 이모지 대신 ASCII
+
+오래된 Ubuntu(18.04 이전: glibc가 유니코드 10 표를 씀)의 터미널이나 그 앞단의 tmux/screen/mosh는 🟢(유니코드 12, 2019) 같은 새 이모지의 폭을 모릅니다. Claude Code는 2칸으로 세는데 그 계층은 1칸으로 세니 그 뒤의 글자가 전부 한 칸씩 어긋나고, 매초 바뀐 숫자만 다시 그리기 때문에 옛 숫자가 남습니다. `11%`가 `114`로, `(13.6%)`가 `(13648)`로 보이는 현상이 그것입니다.
+
+기본 글자 모드 `auto`는 이런 환경이 확인되면 ASCII로 바꿉니다: 로케일이 UTF-8이 아니거나, `TERM`이 `linux`/`dumb`이거나, Windows의 구식 콘솔이거나, Linux 박스의 libc `wcwidth()`가 이 이모지들을 2칸으로 답하지 않는데 그 박스의 로컬 터미널이나 tmux/screen/mosh가 줄을 다시 재는 경우. SSH 건너편의 터미널 프로그램은 볼 수 없으므로, 그래도 깨지면 `settings.json`의 명령 뒤에 `--ascii`를 붙여 강제하세요(또는 환경 변수 `STATUSLINE_GLYPHS=ascii`). 반대는 `--unicode`.
+
+```json
+"statusLine": { "type": "command", "command": "$HOME/.claude/statusline-rs --ascii", "refreshInterval": 1 }
+```
+
+Windows: `"command": "\"C:/Users/you/.claude/statusline-rs.exe\" --ascii"`.
+
+| 유니코드 | ASCII |
+|---|---|
+| `🟢 █░░░░░░░░░` 컨텍스트 게이지(🟢 ⚡ 🔥 🚨는 사용률별) | `[#.........]`, 색은 동일. 경보 상태에서만 `!!` |
+| `⚡max` effort | `eff max` |
+| `⏳3d 14h` 리셋 카운트다운 | `~3d 14h` |
+| `🏠 host` / `🌐 host` | `@host` / `ssh:host` |
+| 구간 안 구분자 `·` | `,` |
+
+```
+Fable 5.1, eff max, think on | [#.........] 136.8K/1M ( 13.6%) | 5h  11% ~0h 42m | 7d  33% used, 15% under pace (23h31m), ~3d 14h | 23h 13m, $539.75
+CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.10.20.2 | claude --resume <sid>
+```
+
+**갱신마다 바뀌는 값은 모두 고정 폭입니다**(두 모드 공통): 퍼센트는 세 자리 오른쪽 정렬(`  4%`, ` 14%`, `100%`), 토큰 수는 6자(` 12.3K`, `136.8K`, ` 1.02M`), 시간은 6자(`0h 42m`, `3d 14h`, `( 8h24m)`). 숫자가 자릿수를 넘어도 뒤가 밀리지 않고, 셀 단위로 다시 그리는 계층은 바뀐 숫자만 고칩니다.
 
 ---
 
