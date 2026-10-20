@@ -1,11 +1,16 @@
 // Claude Code status line — zero-dependency single-file Rust implementation.
 //
-// Install: curl -sSfL https://gist.githubusercontent.com/kinggunil/0c34b865014ca16c446ba46bd9114cd9/raw/install.sh | sh
+// Part of https://github.com/kinggunil/claude-code-addons (installer + claude-notify).
+// Install: macOS/Linux  curl -sSfL https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.sh | sh
+//          Windows      irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.ps1 | iex
 // Build:   rustc --edition 2021 -O statusline.rs -o "$HOME/.claude/statusline-rs"
 // Test:    rustc --edition 2021 --test statusline.rs -o /tmp/sl-test && /tmp/sl-test
 // ~/.claude/settings.json:
 //   "statusLine": { "type": "command", "command": "$HOME/.claude/statusline-rs",
 //                   "refreshInterval": 1 }
+//   Windows: "command": "\"C:/Users/you/.claude/statusline-rs.exe\"" — Claude Code runs
+//   it through Git Bash, which drops unquoted backslashes: C:\Users\you\... would become
+//   C:Usersyou... ("command not found") and the status line would silently never show.
 //
 // Reads Claude Code's JSON on stdin and prints a two-line colored status bar:
 //   line 1 (dim):  claude --resume <sid> | elapsed | cost | rate limits
@@ -33,13 +38,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Status line source version — shown dim at the far right of line 2. Bump this
-// on every gist push so each server/PC displays which revision it is running;
-// comparing the on-screen version against the gist reveals stale machines.
+// on every push so each server/PC displays which revision it is running;
+// comparing the on-screen version against the repo reveals stale machines.
 // Format: YY.MM.DD for the first build of a day, then .2/.3/... appended for
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.07.11";
+const VERSION: &str = "26.10.20";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
