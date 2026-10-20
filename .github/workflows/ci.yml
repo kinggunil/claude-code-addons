@@ -1,0 +1,61 @@
+# Build + unit-test both tools on every OS the installers target, then run the
+# status line once per glyph mode on a sample payload and check the invariants
+# the README promises (pure ASCII in --ascii, a fixed-width line across frames).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        run: rustc --version
+
+      - name: build
+        shell: bash
+        run: |
+          rustc --edition 2021 -O statusline.rs -o ./statusline-rs
+          rustc --edition 2021 -O claude-notify.rs -o ./claude-notify
+
+      - name: unit tests
+        shell: bash
+        run: |
+          rustc --edition 2021 --test statusline.rs -o ./sl-test && ./sl-test
+          rustc --edition 2021 --test claude-notify.rs -o ./cn-test && ./cn-test
+
+      - name: render sample payload in each glyph mode
+        shell: bash
+        run: |
+          now=$(date +%s)
+          payload() {  # $1 used5h  $2 tokens  $3 cost
+            printf '{"session_id":"abc","model":{"display_name":"Opus 4.8 (1M context)"},"cwd":".","effort":{"level":"max"},"thinking":{"enabled":true},"cost":{"total_cost_usd":%s,"total_duration_ms":2520000},"context_window":{"context_window_size":1000000,"total_input_tokens":%s},"rate_limits":{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":33,"resets_at":%s}}}' "$3" "$2" "$1" $((now + 2520)) $((now + 3*86400))
+          }
+          strip() { sed -E $'s/\x1b\\[[0-9;]*m//g'; }
+          echo "--- auto ---";    payload 11 136779 5.37 | ./statusline-rs | strip; echo
+          echo "--- unicode ---"; payload 11 136779 5.37 | ./statusline-rs --unicode | strip; echo
+          echo "--- ascii ---";   payload 11 136779 5.37 | ./statusline-rs --ascii | strip; echo
+          echo "--- claude-notify ---"; ./claude-notify --version
+
+          # --ascii must be pure ASCII (colors aside)
+          bad=$(payload 11 136779 5.37 | ./statusline-rs --ascii | LC_ALL=C tr -d '\000-\177' | wc -c)
+          [ "$bad" -eq 0 ] || { echo "ASCII mode printed $bad non-ASCII bytes"; exit 1; }
+          # the unicode set must still be there when asked for
+          payload 11 136779 5.37 | ./statusline-rs --unicode | grep -q '⏳' || { echo "unicode mode lost its glyphs"; exit 1; }
+          # line 1 keeps its width while the live values move (1% / 9% / 10% / 44%, tokens, cost)
+          w() { payload "$1" "$2" "$3" | ./statusline-rs --unicode | strip | head -1 | awk '{ print length($0) }'; }
+          a=$(w 1 999 0.05); b=$(w 9 9999 0.99); c=$(w 10 12345 1.00); d=$(w 44 136779 5.37)
+          echo "widths: $a $b $c $d"
+          [ "$a" = "$b" ] && [ "$b" = "$c" ] && [ "$c" = "$d" ] || { echo "line width moved between frames"; exit 1; }
+          # a non-UTF-8 locale must fall back to ASCII by itself
+          lang_auto=$(payload 11 136779 5.37 | LANG=C LC_ALL=C ./statusline-rs | LC_ALL=C tr -d '\000-\177' | wc -c)
+          [ "$lang_auto" -eq 0 ] || { echo "auto mode printed non-ASCII under LANG=C"; exit 1; }
