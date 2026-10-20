@@ -59,3 +59,14 @@ jobs:
           # a non-UTF-8 locale must fall back to ASCII by itself
           lang_auto=$(payload 11 136779 5.37 | LANG=C LC_ALL=C ./statusline-rs | LC_ALL=C tr -d '\000-\177' | wc -c)
           [ "$lang_auto" -eq 0 ] || { echo "auto mode printed non-ASCII under LANG=C"; exit 1; }
+          # a narrow terminal: every line fits --width and the budget numbers survive
+          # (checked in ASCII mode, where bytes == columns for awk's length())
+          for w in 118 100 80 60; do
+            out=$(payload 11 136779 5.37 | ./statusline-rs --ascii --width $w | strip)
+            echo "$out" | awk -v w="$w" 'length($0) > w { print "wider than " w ": " $0; bad = 1 } END { exit bad }' || exit 1
+            echo "$out" | grep -q '5h  11%' || { echo "5h usage lost at width $w"; exit 1; }
+          done
+          echo "--- ascii at 118 columns ---"; payload 11 136779 5.37 | ./statusline-rs --ascii --width 118 | strip; echo
+          # COLUMNS alone (what Claude Code sets) fits too, keeping a 2-column margin
+          out=$(payload 11 136779 5.37 | COLUMNS=120 ./statusline-rs --ascii | strip | head -1)
+          [ "$(printf '%s' "$out" | awk '{ print length($0) }')" -le 118 ] || { echo "COLUMNS=120 not honoured: $out"; exit 1; }

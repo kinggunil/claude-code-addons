@@ -100,22 +100,26 @@ Two lines under the prompt, split by domain — your **Claude session** on top,
 
 ```
 Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M ( 12.7%) | 5h   9% ⏳3h 54m | 7d  23% used ·  5% over pace ( 8h24m) · ⏳5d 17h | 4h 31m · $2.74
-CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.10.20.2 | claude --resume <sid>
+CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.10.20.3 | claude --resume <sid>
 ```
 
 On an SSH session the host segment turns orange and switches icon, so the whole
 bottom line reads as "the box this session is really on":
 
 ```
-CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.2 | claude --resume <sid>
+CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.3 | claude --resume <sid>
 ```
 
 - **Line 1 — Claude session**: model, effort, thinking toggle, context gauge,
   then Claude.ai rate-limit usage (Pro/Max) — each window as `used%` plus a reset
   countdown behind an ⏳. The 7-day window adds a **weekly pace** in plain words:
-  `N% over pace` (burning faster than the even Saturday-04:00-KST reset line) or
+  `N% over pace` (burning faster than the even reset-to-reset line) or
   `N% under pace` (headroom), colored by how much slack you have and annotated
-  with that gap re-expressed as time; then elapsed time and cost.
+  with that gap re-expressed as time; then elapsed time and cost. The pace is
+  measured against the `resets_at` Claude Code reports for the 7-day window.
+  Without rate-limit data (API-key sessions) the week is assumed to reset
+  Saturday 04:00 KST, the author's plan; set `STATUSLINE_WEEK_ANCHOR` to the
+  Unix seconds of any reset instant of yours to change that.
 - **Line 2 — this machine**: CPU/RAM/VM first (the only live-changing values, so
   they get the leftmost first-read spot), then the machine **host** (🏠 cyan =
   local, 🌐 orange = SSH remote — the hostname comes from wherever the status line
@@ -164,15 +168,31 @@ Windows: `"command": "\"C:/Users/you/.claude/statusline-rs.exe\" --ascii"`.
 
 ```
 Fable 5.1, eff max, think on | [#.........] 136.8K/1M ( 13.6%) | 5h  11% ~0h 42m | 7d  33% used, 15% under pace (23h31m), ~3d 14h | 23h 13m, $539.75
-CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.10.20.2 | claude --resume <sid>
+CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.10.20.3 | claude --resume <sid>
 ```
 
 **Every value that changes between refreshes has a fixed width**, in both
 modes: percentages are right-aligned to three digits (`  4%`, ` 14%`, `100%`),
 token counts to six characters (` 12.3K`, `136.8K`, ` 1.02M`), spans to six
-(`0h 42m`, `3d 14h`, `( 8h24m)`). A number growing a digit no longer pushes the
-rest of the line along, and a cell-diffing layer repaints only the digits that
-changed.
+(`0h 42m`, `3d 14h`, `( 8h24m)`), elapsed time and cost to seven (` 0h 42m`,
+`  $5.37`). A number growing a digit no longer pushes the rest of the line
+along, and a cell-diffing layer repaints only the digits that changed.
+
+### Narrow terminals
+
+Claude Code passes the terminal size in `COLUMNS`, and each line is fitted to it
+(2 columns are left for Claude Code's own framing) by shedding pieces in a fixed
+order until it fits: the resume command, the pace time in parentheses, cost,
+version, elapsed, `think`, the pace words, VM, effort, the 5h countdown, the
+gauge, the 7d countdown, RAM, dir, then the token count (its percentage stays).
+Nothing wraps, and the budget numbers are the last to go. `--width N` (or
+`STATUSLINE_WIDTH`) overrides the detected width; `--width 0` never shortens.
+In a 120-column window the lines above become:
+
+```
+Fable 5.1 · ⚡max | 🟢 █░░░░░░░░░ 136.8K/1M ( 13.7%) | 5h  11% ⏳0h 41m | 7d  33% used · 16% under pace · ⏳3d 13h
+CPU  23% · RAM  78% · VM  77% · 🏠 my-mac | mydir | v26.10.20.3
+```
 
 ---
 

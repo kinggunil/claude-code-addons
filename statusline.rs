@@ -32,6 +32,12 @@
 // Every changing field is fixed-width ("  4%", "0h 42m", "136.8K", " 1d06h") so
 //   the line never shifts as numbers grow, and a cell-diffing layer repaints only
 //   the digits that changed.
+// Width: Claude Code puts the terminal size in COLUMNS before running the script.
+//   Each line is fitted to it (minus a 2-column margin for Claude Code's framing)
+//   by shedding pieces in a fixed order — resume command, pace detail, cost,
+//   version, elapsed, think, pace words, VM, effort, 5h countdown, gauge, 7d
+//   countdown, RAM, dir, token count — so a narrow window never wraps the line.
+//   `--width N` (or STATUSLINE_WIDTH) overrides; 0 disables fitting.
 //
 // CPU% is the average load since the previous refresh: cumulative kernel counters
 // are cached in ~/.claude/.statusline-cpu.json. First run falls back to a 0.1 s
@@ -55,7 +61,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.10.20.2";
+const VERSION: &str = "26.10.20.3";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -426,6 +432,274 @@ fn libc_widths_ok() -> Option<bool> {
 #[cfg(not(target_os = "linux"))]
 fn libc_widths_ok() -> Option<bool> {
     None
+}
+
+// ---------------- width-aware layout ----------------
+
+// Drop ranks: on a terminal narrower than the line, pieces are shed in this order
+// (lowest first) until it fits. The live budget numbers survive longest.
+const R_RESUME: u8 = 5;
+const R_PACE_TIME: u8 = 10;
+const R_COST: u8 = 15;
+const R_VERSION: u8 = 20;
+const R_ELAPSED: u8 = 25;
+const R_THINK: u8 = 30;
+const R_PACE_WORDS: u8 = 35;
+const R_VM: u8 = 36;
+const R_EFFORT: u8 = 40;
+const R_RESET_5H: u8 = 45;
+const R_GAUGE: u8 = 50;
+const R_RESET_7D: u8 = 55;
+const R_RAM: u8 = 60;
+const R_DIR: u8 = 65;
+const R_TOKENS: u8 = 70;
+const R_HOST: u8 = 75;
+const R_CPU: u8 = 80;
+const R_USED_7D: u8 = 85;
+const R_USED_5H: u8 = 90;
+
+/// One piece of a sector with progressively shorter renderings: `cands[0]` is the
+/// full text and moving on to `cands[i + 1]` has priority `ranks[i]` (lower goes
+/// first). An empty candidate removes the piece, separator included.
+struct Item {
+    cands: Vec<String>,
+    ranks: Vec<u8>,
+    idx: usize,
+}
+
+impl Item {
+    /// Never shortened or dropped.
+    fn fixed(text: String) -> Item {
+        Item {
+            cands: vec![text],
+            ranks: Vec::new(),
+            idx: 0,
+        }
+    }
+    /// Dropped whole at `rank`.
+    fn optional(text: String, rank: u8) -> Item {
+        Item {
+            cands: vec![text, String::new()],
+            ranks: vec![rank],
+            idx: 0,
+        }
+    }
+    /// Shortened step by step: `cands` from longest to shortest, one rank per step.
+    fn steps(cands: Vec<String>, ranks: Vec<u8>) -> Item {
+        debug_assert_eq!(cands.len(), ranks.len() + 1);
+        Item {
+            cands,
+            ranks,
+            idx: 0,
+        }
+    }
+    fn text(&self) -> &str {
+        &self.cands[self.idx]
+    }
+    fn next_rank(&self) -> Option<u8> {
+        self.ranks.get(self.idx).copied()
+    }
+}
+
+/// A group of pieces with its own joiner (" · " within a sector, " " in the
+/// context and 5h sectors). Sectors are joined by " | " and vanish when empty.
+struct Sector {
+    items: Vec<Item>,
+    joiner: String,
+}
+
+impl Sector {
+    fn new(joiner: &str) -> Sector {
+        Sector {
+            items: Vec::new(),
+            joiner: joiner.to_string(),
+        }
+    }
+    fn one(item: Item) -> Sector {
+        Sector {
+            items: vec![item],
+            joiner: String::new(),
+        }
+    }
+    fn push(&mut self, item: Item) {
+        self.items.push(item);
+    }
+    fn render(&self) -> String {
+        let parts: Vec<&str> = self
+            .items
+            .iter()
+            .map(Item::text)
+            .filter(|t| !t.is_empty())
+            .collect();
+        parts.join(&self.joiner)
+    }
+}
+
+fn render_line(sectors: &[Sector], sep: &str) -> String {
+    let parts: Vec<String> = sectors
+        .iter()
+        .map(Sector::render)
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.join(sep)
+}
+
+/// Shed the lowest-ranked pieces until the line fits `width` columns (None =
+/// unlimited). When nothing is left to shed, the shortest form is returned as is.
+fn fit_line(mut sectors: Vec<Sector>, width: Option<usize>, sep: &str) -> String {
+    loop {
+        let line = render_line(&sectors, sep);
+        let w = match width {
+            Some(w) => w,
+            None => return line,
+        };
+        if display_width(&line) <= w {
+            return line;
+        }
+        let mut best: Option<(u8, usize, usize)> = None;
+        for (si, s) in sectors.iter().enumerate() {
+            for (ii, it) in s.items.iter().enumerate() {
+                if let Some(r) = it.next_rank() {
+                    if best.map_or(true, |b| r < b.0) {
+                        best = Some((r, si, ii));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((_, si, ii)) => sectors[si].items[ii].idx += 1,
+            None => return line,
+        }
+    }
+}
+
+/// Columns a terminal uses for `s`: ANSI escape sequences take none, East Asian
+/// wide characters and emoji take two, everything else one. This mirrors the
+/// tables modern terminals draw with (the ASCII mode exists for the ones that don't).
+fn display_width(s: &str) -> usize {
+    let mut w = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ params... final byte 0x40-0x7E (SGR colors end in 'm')
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        w += char_cols(c);
+    }
+    w
+}
+
+fn char_cols(c: char) -> usize {
+    let u = c as u32;
+    if u < 0x20 || (0x7F..0xA0).contains(&u) {
+        return 0;
+    }
+    if matches!(u, 0x0300..=0x036F | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F) {
+        return 0; // combining marks, zero-width, variation selectors
+    }
+    let wide = matches!(
+        u,
+        0x1100..=0x115F
+            | 0x231A..=0x231B
+            | 0x2329..=0x232A
+            | 0x23E9..=0x23EC
+            | 0x23F0
+            | 0x23F3
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F004
+            | 0x1F0CF
+            | 0x1F18E
+            | 0x1F191..=0x1F19A
+            | 0x1F200..=0x1F251
+            | 0x1F300..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F7E0..=0x1F7EB
+            | 0x1F90C..=0x1F9FF
+            | 0x1FA70..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// Columns each line may use: `--width N` (0 = unlimited), else STATUSLINE_WIDTH,
+/// else the COLUMNS Claude Code sets before running the script, less a 2-column
+/// margin for its own framing. None when nothing is known: no fitting.
+fn target_width<I: IntoIterator<Item = String>>(
+    args: I,
+    env_width: Option<&str>,
+    columns: Option<&str>,
+) -> Option<usize> {
+    fn num(s: &str) -> Option<usize> {
+        s.trim().parse::<usize>().ok()
+    }
+    let mut explicit: Option<usize> = None;
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        let v = match a.as_str() {
+            "--width" => args.next().as_deref().and_then(num),
+            s => s.strip_prefix("--width=").and_then(num),
+        };
+        if v.is_some() {
+            explicit = v;
+        }
+    }
+    match explicit.or_else(|| env_width.and_then(num)) {
+        Some(0) => None,
+        Some(w) => Some(w),
+        None => columns.and_then(num).map(|c| c.saturating_sub(2)),
+    }
 }
 
 // ---------------- minimal JSON ----------------
@@ -1139,7 +1413,36 @@ fn fmt_pct(v: f64) -> String {
 /// e.g. "5h  23% ⏳4h 12m" — reset countdown omitted when resets_at/now is
 /// unavailable or already in the past (clock skew / stale sample). `pct` is
 /// clipped to 0-100 defensively since it comes straight from the harness JSON,
-/// not a locally-computed value.
+/// not a locally-computed value. On a narrow terminal the countdown is shed
+/// long before the percentage.
+fn rate_limit_sector(
+    label: &str,
+    pct: f64,
+    resets_at: Option<f64>,
+    now: Option<f64>,
+    g: &Glyphs,
+) -> Sector {
+    let pct = clip(pct);
+    let mut s = Sector::new(" ");
+    s.push(Item::optional(
+        format!("{}{} {}{}%{}", C_DIM, label, color_for_pct(pct), fmt_pct(pct), RESET),
+        R_USED_5H,
+    ));
+    if let (Some(r), Some(n)) = (resets_at, now) {
+        if r > n {
+            if let Some(rem) = fmt_duration((r - n) * 1000.0) {
+                // ⏳ marks the reset countdown, matching the 7d segment
+                s.push(Item::optional(
+                    format!("{}{}{}{}", C_OFF, g.hourglass(), rem, RESET),
+                    R_RESET_5H,
+                ));
+            }
+        }
+    }
+    s
+}
+
+#[cfg(test)]
 fn rate_limit_segment(
     label: &str,
     pct: f64,
@@ -1147,17 +1450,7 @@ fn rate_limit_segment(
     now: Option<f64>,
     g: &Glyphs,
 ) -> String {
-    let pct = clip(pct);
-    let mut seg = format!("{} {}{}%{}", label, color_for_pct(pct), fmt_pct(pct), RESET);
-    if let (Some(r), Some(n)) = (resets_at, now) {
-        if r > n {
-            if let Some(rem) = fmt_duration((r - n) * 1000.0) {
-                // ⏳ marks the reset countdown, matching the 7d segment
-                seg.push_str(&format!(" {}{}{}{}", C_OFF, g.hourglass(), rem, RESET));
-            }
-        }
-    }
-    seg
+    rate_limit_sector(label, pct, resets_at, now, g).render()
 }
 
 // ---- weekly usage pace (Claude Max weekly quota) ----
@@ -1176,10 +1469,26 @@ const WEEK_ANCHOR: f64 = 1_704_481_200.0; // Sat 2024-01-06 04:00 KST, unix seco
 /// remaining); falls back to the fixed Saturday-04:00-KST grid when resets_at is
 /// absent or out of range (already past / >1 week away from clock skew).
 fn week_elapsed_secs(resets_at: Option<f64>, now: f64) -> f64 {
+    week_elapsed_secs_at(resets_at, now, week_anchor())
+}
+
+/// Same, against an explicit fallback grid: any instant at which the week resets.
+fn week_elapsed_secs_at(resets_at: Option<f64>, now: f64, anchor: f64) -> f64 {
     match resets_at {
         Some(r) if r > now && r - now <= WEEK_SECS => WEEK_SECS - (r - now),
-        _ => (now - WEEK_ANCHOR).rem_euclid(WEEK_SECS),
+        _ => (now - anchor).rem_euclid(WEEK_SECS),
     }
+}
+
+/// The fallback reset grid: STATUSLINE_WEEK_ANCHOR (unix seconds of any reset
+/// instant of your plan) when set and sane, else the built-in Saturday 04:00 KST.
+/// Only consulted when the harness sends no 7-day resets_at (API-key sessions).
+fn week_anchor() -> f64 {
+    std::env::var("STATUSLINE_WEEK_ANCHOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|a| a.is_finite() && *a > 0.0)
+        .unwrap_or(WEEK_ANCHOR)
 }
 
 /// "3d 14h", "0d 05h" — fixed 6-character span for the weekly reset countdown
@@ -1258,35 +1567,56 @@ fn pace_time(delta: f64) -> Option<String> {
 ///   time only:  "wk  21% · ⏳5d 12h"
 /// Every number is fixed-width so the segment only changes length when the pace
 /// flips between over/under/on.
-fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64, g: &Glyphs) -> String {
+fn weekly_sector(used: Option<f64>, resets_at: Option<f64>, now: f64, g: &Glyphs) -> Sector {
     let elapsed = week_elapsed_secs(resets_at, now);
     let elapsed_pct = clip(elapsed / WEEK_SECS * 100.0);
     let countdown = fmt_span(WEEK_SECS - elapsed);
 
-    let mut seg = if let Some(u) = used {
+    let mut s = Sector::new(&g.dot());
+    if let Some(u) = used {
         let u = clip(u);
         let delta = u - elapsed_pct;
         let col = pace_color(delta);
         let d = delta.round() as i64;
-        // the same gap re-expressed as time, in parens right after the words
-        let t = pace_time(delta)
-            .map(|t| format!(" ({})", t))
-            .unwrap_or_default();
-        let pace = if d > 0 {
-            format!("{}{:>2}% over pace{}{}", col, d, t, RESET)
+        s.push(Item::optional(
+            format!("{}7d {}% used{}", C_DIM, fmt_pct(u), RESET),
+            R_USED_7D,
+        ));
+        let words = if d > 0 {
+            format!("{:>2}% over pace", d)
         } else if d < 0 {
-            format!("{}{:>2}% under pace{}{}", col, -d, t, RESET)
+            format!("{:>2}% under pace", -d)
         } else {
-            format!("{}on pace{}", col, RESET)
+            "on pace".to_string()
         };
-        format!("7d {}% used{}{}", fmt_pct(u), g.dot(), pace)
+        // the same gap re-expressed as time, in parens right after the words; on a
+        // narrow terminal the parens go first and the words much later
+        let short = format!("{}{}{}", col, words, RESET);
+        s.push(match pace_time(delta) {
+            Some(t) => Item::steps(
+                vec![format!("{}{} ({}){}", col, words, t, RESET), short, String::new()],
+                vec![R_PACE_TIME, R_PACE_WORDS],
+            ),
+            None => Item::optional(short, R_PACE_WORDS),
+        });
     } else {
-        format!("{}wk {}%{}", C_OFF, fmt_pct(elapsed_pct), RESET)
-    };
-    if let Some(c) = countdown {
-        seg.push_str(&format!("{}{}{}{}{}", g.dot(), C_OFF, g.hourglass(), c, RESET));
+        s.push(Item::optional(
+            format!("{}wk {}%{}", C_OFF, fmt_pct(elapsed_pct), RESET),
+            R_USED_7D,
+        ));
     }
-    seg
+    if let Some(c) = countdown {
+        s.push(Item::optional(
+            format!("{}{}{}{}", C_OFF, g.hourglass(), c, RESET),
+            R_RESET_7D,
+        ));
+    }
+    s
+}
+
+#[cfg(test)]
+fn weekly_segment(used: Option<f64>, resets_at: Option<f64>, now: f64, g: &Glyphs) -> String {
+    weekly_sector(used, resets_at, now, g).render()
 }
 
 fn bar(pct: f64, width: usize, g: &Glyphs) -> String {
@@ -1319,6 +1649,11 @@ fn main() {
         ),
         &ancestors,
         host.as_deref(),
+    );
+    let width = target_width(
+        std::env::args().skip(1),
+        std::env::var("STATUSLINE_WIDTH").ok().as_deref(),
+        std::env::var("COLUMNS").ok().as_deref(),
     );
 
     let mut input = String::new();
@@ -1451,62 +1786,42 @@ fn main() {
     let sep = format!(" {}|{} ", C_SEP, RESET); // between sectors
     let dot = g.dot(); // within a sector
 
-    // ---- line 1 (dim): [spend: elapsed · cost] | [5h] | [7d] | [resume] ----
-    // ordered by glance-frequency: budget first, the rarely-read resume id last.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|t| t.as_secs_f64());
-    let mut meta: Vec<String> = Vec::new();
 
-    // limits first — the real constraints (colored, high value). Pro/Max only,
-    // appears after the first API response; each window may be independently absent.
-    let mut seven_used = None;
-    let mut seven_reset = None;
-    if let Some(rl) = d.get("rate_limits") {
-        if let Some(pct) = rl.path(&["five_hour", "used_percentage"]).and_then(Json::as_f64) {
-            let resets_at = rl.path(&["five_hour", "resets_at"]).and_then(Json::as_f64);
-            meta.push(rate_limit_segment("5h", pct, resets_at, now, &g));
-        }
-        seven_used = rl.path(&["seven_day", "used_percentage"]).and_then(Json::as_f64);
-        seven_reset = rl.path(&["seven_day", "resets_at"]).and_then(Json::as_f64);
-    }
-    if let Some(n) = now {
-        meta.push(weekly_segment(seven_used, seven_reset, n, &g));
-    }
-
-    // lower priority: elapsed · cost — demoted to the right, plain dim (cost is an
-    // API-equivalent figure, not a subscription charge), just before the resume ref.
-    let mut spend: Vec<String> = Vec::new();
-    if let Some(ds) = &dur_str {
-        spend.push(ds.clone());
-    }
-    if cost_usd > 0.0 {
-        spend.push(format!("${:.2}", cost_usd));
-    }
-    if !spend.is_empty() {
-        meta.push(spend.join(&dot));
-    }
-
-
-    // ---- Two lines split by domain ----
-    //   Claude (session): mode · context | 5h | 7d | elapsed·cost
+    // ---- Two lines split by domain, each fitted to the terminal width ----
+    //   Claude (session): mode · context | 5h | 7d | elapsed · cost
     //   Local  (machine): CPU · RAM · VM · host | dir | version | resume
-    let mut claude: Vec<String> = Vec::new();
+    // Every piece carries a drop rank (R_*): on a narrow terminal the lowest go first.
+    let mut claude: Vec<Sector> = Vec::new();
 
     // mode sector: model · effort · think
-    let mut mode: Vec<String> = Vec::new();
+    let mut mode = Sector::new(&dot);
     // drop the verbose " context" suffix (e.g. "Opus 4.8 (1M context)" -> "(1M)")
-    mode.push(format!("{}{}{}{}", BOLD, C_MODEL, model.replace(" context", ""), RESET));
+    mode.push(Item::fixed(format!(
+        "{}{}{}{}",
+        BOLD,
+        C_MODEL,
+        model.replace(" context", ""),
+        RESET
+    )));
     if !effort.is_empty() {
-        mode.push(format!("{}{}{}", color_for_effort(effort), g.effort(effort), RESET));
+        mode.push(Item::optional(
+            format!("{}{}{}", color_for_effort(effort), g.effort(effort), RESET),
+            R_EFFORT,
+        ));
     }
-    mode.push(if thinking {
-        format!("{}think on{}", C_ON, RESET)
-    } else {
-        format!("{}think off{}", C_OFF, RESET)
-    });
-    claude.push(mode.join(&dot));
+    mode.push(Item::optional(
+        if thinking {
+            format!("{}think on{}", C_ON, RESET)
+        } else {
+            format!("{}think off{}", C_OFF, RESET)
+        },
+        R_THINK,
+    ));
+    claude.push(mode);
 
     // context sector: the most-actionable live metric, placed right after mode.
     if ctx_tokens > 0 {
@@ -1518,59 +1833,112 @@ fn main() {
         };
         let col = color_for_pct(pct);
         let marker = g.ctx_marker(pct, exceeds_200k && max_ctx <= 200_000);
-        claude.push(format!(
-            "{}{} {}{}/{} ({:>5.1}%){}",
-            marker,
-            bar(pct, 10, &g),
-            col,
-            fmt_tokens(ctx_tokens),
-            max_label,
-            pct,
-            RESET
+        let mut ctx = Sector::new(" ");
+        ctx.push(Item::optional(
+            format!("{}{}", marker, bar(pct, 10, &g)),
+            R_GAUGE,
+        ));
+        // the count shrinks to the bare percentage, late, and the percentage stays
+        ctx.push(Item::steps(
+            vec![
+                format!(
+                    "{}{}/{} ({:>5.1}%){}",
+                    col,
+                    fmt_tokens(ctx_tokens),
+                    max_label,
+                    pct,
+                    RESET
+                ),
+                format!("{}{:>5.1}%{}", col, pct, RESET),
+            ],
+            vec![R_TOKENS],
+        ));
+        claude.push(ctx);
+    }
+
+    // limits — the real constraints (colored, high value). Pro/Max only, appears
+    // after the first API response; each window may be independently absent.
+    let mut seven_used = None;
+    let mut seven_reset = None;
+    if let Some(rl) = d.get("rate_limits") {
+        if let Some(pct) = rl.path(&["five_hour", "used_percentage"]).and_then(Json::as_f64) {
+            let resets_at = rl.path(&["five_hour", "resets_at"]).and_then(Json::as_f64);
+            claude.push(rate_limit_sector("5h", pct, resets_at, now, &g));
+        }
+        seven_used = rl.path(&["seven_day", "used_percentage"]).and_then(Json::as_f64);
+        seven_reset = rl.path(&["seven_day", "resets_at"]).and_then(Json::as_f64);
+    }
+    if let Some(n) = now {
+        claude.push(weekly_sector(seven_used, seven_reset, n, &g));
+    }
+
+    // lower priority: elapsed · cost — demoted to the right, plain dim (cost is an
+    // API-equivalent figure, not a subscription charge). Both right-aligned to 7
+    // characters, so they only widen past 99 hours / $999.
+    let mut spend = Sector::new(&dot);
+    if let Some(ds) = &dur_str {
+        spend.push(Item::optional(
+            format!("{}{:>7}{}", C_DIM, ds, RESET),
+            R_ELAPSED,
         ));
     }
-
-    // remaining session refs (5h | 7d | elapsed·cost), dim on the right
-    for m in &meta {
-        claude.push(format!("{}{}{}", C_DIM, m, RESET));
+    if cost_usd > 0.0 {
+        spend.push(Item::optional(
+            format!("{}{:>7}{}", C_DIM, format!("${:.2}", cost_usd), RESET),
+            R_COST,
+        ));
     }
-    let claude_line = claude.join(&sep);
+    claude.push(spend);
 
     // ---- Local (machine) line: CPU · RAM · VM · host | dir | version | resume ----
-    let mut local: Vec<String> = Vec::new();
+    let mut local: Vec<Sector> = Vec::new();
 
     // machine sector first, live meters leading: CPU · RAM · VM at the very left
     // edge (first-read anchor), then host (🏠 local / 🌐 SSH remote)
-    let mut machine: Vec<String> = Vec::new();
+    let mut machine = Sector::new(&dot);
     let cpu = cpu_percent();
     let (ram, vm) = plat::mem();
-    for (label, val) in [("CPU", cpu), ("RAM", ram), ("VM", vm)] {
+    for (label, val, rank) in [("CPU", cpu, R_CPU), ("RAM", ram, R_RAM), ("VM", vm, R_VM)] {
         if let Some(v) = val {
-            machine.push(format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET));
+            machine.push(Item::optional(
+                format!("{} {}{}%{}", label, color_for_pct(v), fmt_pct(v), RESET),
+                rank,
+            ));
         }
     }
     if let Some(h) = &host {
         let remote = is_remote(&ancestors, Some(h.as_str()));
         let hc = if remote { fg(214) } else { C_HOST.to_string() };
-        machine.push(format!("{}{}{}", hc, g.host(h, remote), RESET));
+        machine.push(Item::optional(
+            format!("{}{}{}", hc, g.host(h, remote), RESET),
+            R_HOST,
+        ));
     }
-    if !machine.is_empty() {
-        local.push(machine.join(&dot));
-    }
+    local.push(machine);
 
     // dir sector
-    local.push(format!("{}{}{}", C_DIR, base, RESET));
+    local.push(Sector::one(Item::optional(
+        format!("{}{}{}", C_DIR, base, RESET),
+        R_DIR,
+    )));
 
     // version: build tag for cross-machine update checks
-    local.push(format!("{}v{}{}", C_DIM, VERSION, RESET));
+    local.push(Sector::one(Item::optional(
+        format!("{}v{}{}", C_DIM, VERSION, RESET),
+        R_VERSION,
+    )));
 
     // resume: full command at the far right of the machine line (dim reference;
-    // rightmost so a narrow terminal truncates it first, not the stats you watch).
+    // the first thing to go on a narrow terminal, not the stats you watch).
     if !sid.is_empty() {
-        local.push(format!("{}claude --resume {}{}", C_DIM, sid, RESET));
+        local.push(Sector::one(Item::optional(
+            format!("{}claude --resume {}{}", C_DIM, sid, RESET),
+            R_RESUME,
+        )));
     }
 
-    let local_line = local.join(&sep);
+    let claude_line = fit_line(claude, width, &sep);
+    let local_line = fit_line(local, width, &sep);
 
     if claude_line.is_empty() {
         print!("{}", local_line);
@@ -1963,5 +2331,130 @@ mod tests {
             assert_eq!(c, d);
             assert_eq!(w(bar(0.0, 10, &g)), w(bar(100.0, 10, &g)));
         }
+    }
+
+    #[test]
+    fn week_anchor_override_shifts_the_fallback_grid() {
+        // with resets_at the anchor is irrelevant; without it, elapsed is measured
+        // from the given grid
+        let now = WEEK_ANCHOR + 86_400.0;
+        assert_eq!(week_elapsed_secs_at(Some(now + 3600.0), now, 0.0), WEEK_SECS - 3600.0);
+        assert_eq!(week_elapsed_secs_at(None, now, WEEK_ANCHOR), 86_400.0);
+        assert_eq!(week_elapsed_secs_at(None, now, WEEK_ANCHOR + 3600.0), 86_400.0 - 3600.0);
+        assert_eq!(week_elapsed_secs_at(None, now, now), 0.0);
+    }
+
+    #[test]
+    fn display_width_counts_terminal_columns() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("🟢 █░ ⏳3d"), 2 + 1 + 1 + 1 + 1 + 2 + 2);
+        assert_eq!(display_width("한글 host"), 4 + 5);
+        assert_eq!(display_width(&format!("{}x{}", C_DIM, RESET)), 1);
+        assert_eq!(display_width(&bar(50.0, 10, &Glyphs::UNICODE)), 10);
+        assert_eq!(display_width(&bar(50.0, 10, &Glyphs::ASCII)), 12);
+        assert_eq!(display_width(" · "), 3);
+    }
+
+    #[test]
+    fn target_width_precedence() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(target_width(a(&[]), None, None), None);
+        assert_eq!(target_width(a(&[]), None, Some("120")), Some(118)); // COLUMNS minus the margin
+        assert_eq!(target_width(a(&[]), Some("100"), Some("120")), Some(100));
+        assert_eq!(target_width(a(&["--width", "90"]), Some("100"), Some("120")), Some(90));
+        assert_eq!(target_width(a(&["--width=80"]), None, None), Some(80));
+        assert_eq!(target_width(a(&["--width", "0"]), None, Some("120")), None); // 0 = never shorten
+        assert_eq!(target_width(a(&["--ascii"]), None, Some("abc")), None);
+    }
+
+    #[test]
+    fn fit_line_sheds_lowest_rank_first() {
+        let sep = " | ";
+        let build = || {
+            let mut a = Sector::new(" . ");
+            a.push(Item::fixed("model".to_string()));
+            a.push(Item::optional("think on".to_string(), 30));
+            let mut b = Sector::new(" . ");
+            b.push(Item::fixed("7d 33% used".to_string()));
+            b.push(Item::steps(
+                vec![
+                    "16% under pace ( 1d02h)".to_string(),
+                    "16% under pace".to_string(),
+                    String::new(),
+                ],
+                vec![10, 35],
+            ));
+            let c = Sector::one(Item::optional("claude --resume abc".to_string(), 5));
+            vec![a, b, c]
+        };
+        let full = "model . think on | 7d 33% used . 16% under pace ( 1d02h) | claude --resume abc";
+        assert_eq!(fit_line(build(), None, sep), full);
+        assert_eq!(fit_line(build(), Some(200), sep), full);
+        // 1st: the resume command goes, separator included
+        assert_eq!(
+            fit_line(build(), Some(full.len() - 1), sep),
+            "model . think on | 7d 33% used . 16% under pace ( 1d02h)"
+        );
+        // 2nd: the pace parenthetical
+        assert_eq!(
+            fit_line(build(), Some(50), sep),
+            "model . think on | 7d 33% used . 16% under pace"
+        );
+        // 3rd: think; 4th: the pace words
+        assert_eq!(fit_line(build(), Some(40), sep), "model | 7d 33% used . 16% under pace");
+        assert_eq!(fit_line(build(), Some(20), sep), "model | 7d 33% used");
+        // nothing left to shed: the shortest form comes back even if it still overflows
+        assert_eq!(fit_line(build(), Some(5), sep), "model | 7d 33% used");
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_the_budget_numbers() {
+        // a realistic ~150-column line 1 squeezed into narrower terminals
+        let g = Glyphs::UNICODE;
+        let dot = g.dot();
+        let sep = format!(" {}|{} ", C_SEP, RESET);
+        let line = |width: Option<usize>| {
+            let mut mode = Sector::new(&dot);
+            mode.push(Item::fixed(format!("{}{}Fable 5.1{}", BOLD, C_MODEL, RESET)));
+            mode.push(Item::optional(
+                format!("{}{}{}", color_for_effort("max"), g.effort("max"), RESET),
+                R_EFFORT,
+            ));
+            mode.push(Item::optional(format!("{}think on{}", C_ON, RESET), R_THINK));
+            let mut ctx = Sector::new(" ");
+            ctx.push(Item::optional(
+                format!("{}{}", g.ctx_marker(13.7, false), bar(13.7, 10, &g)),
+                R_GAUGE,
+            ));
+            ctx.push(Item::steps(
+                vec![
+                    format!("{}/1M ({:>5.1}%)", fmt_tokens(136_779), 13.7),
+                    format!("{:>5.1}%", 13.7),
+                ],
+                vec![R_TOKENS],
+            ));
+            let five = rate_limit_sector("5h", 11.0, Some(3520.0), Some(1000.0), &g);
+            let seven = weekly_sector(
+                Some(33.0),
+                Some(1000.0 + 3.0 * 86_400.0 + 13.0 * 3600.0),
+                1000.0,
+                &g,
+            );
+            let mut spend = Sector::new(&dot);
+            spend.push(Item::optional(format!("{:>7}", "23h 13m"), R_ELAPSED));
+            spend.push(Item::optional(format!("{:>7}", "$539.75"), R_COST));
+            fit_line(vec![mode, ctx, five, seven, spend], width, &sep)
+        };
+        let full = line(None);
+        assert!(display_width(&full) > 150, "{}", visible(&full));
+        for w in [118usize, 100, 80, 60] {
+            let l = line(Some(w));
+            let v = visible(&l);
+            assert!(display_width(&l) <= w, "width {}: {} cols: {}", w, display_width(&l), v);
+            assert!(v.contains("5h  11%") && v.contains("7d  33% used"), "width {}: {}", w, v);
+        }
+        let at_118 = visible(&line(Some(118)));
+        assert!(at_118.contains("% under pace"), "pace words outlive think: {}", at_118);
+        assert!(!at_118.contains("think on"), "{}", at_118);
     }
 }
