@@ -27,7 +27,7 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 그다음 **Claude Code를 재시작**(또는 새 세션 시작)하세요.
 
-설치 스크립트는 소스 + 내장 음성을 내려받고, `rustc`가 없으면 rustup으로 Rust 툴체인을 설치(macOS/Linux; Windows는 Rust를 먼저 직접 설치)한 뒤 두 바이너리를 `~/.claude`에 컴파일하고, 기본 설정 `~/.claude/.claude-notify.json`을 작성하고, `~/.claude/settings.json`에 `statusLine` 블록과 `claude-notify` 훅 3개를 추가합니다. 기존 설정은 보존되고 `settings.json.bak`으로 백업되며, 재실행해도 중복되지 않습니다(idempotent).
+설치 스크립트는 소스 + 내장 음성을 내려받고, `rustc`가 없으면 rustup으로 Rust 툴체인을 설치(macOS/Linux; Windows는 Rust를 먼저 직접 설치)한 뒤 두 바이너리를 `~/.claude`에 컴파일하고, 기본 설정 `~/.claude/.claude-notify.json`을 작성하고, `~/.claude/settings.json`에 `statusLine` 블록과 `claude-notify` 훅 3개를 추가합니다. 기존 설정은 보존되고 `settings.json.bak`으로 백업되며, 재실행해도 중복되지 않습니다(idempotent). Windows에서는 마지막에 각 명령을 Claude Code와 똑같이 Git Bash로 실행해 보므로, 경로가 잘못됐다면 상태줄이 조용히 안 보이는 대신 설치 출력에 빨간 줄로 바로 드러납니다.
 
 **소리 전송 대상도 자동으로 설정합니다.** 설치 스크립트가 이 머신이 스피커 있는 기계인지 헤드리스/SSH 박스인지 감지해서 맞게 세팅하므로, 같은 한 줄 명령이 양쪽에서 알아서 올바르게 동작합니다:
 
@@ -36,7 +36,7 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
 
 기존 `.claude-notify.json`은 절대 덮어쓰지 않습니다. SSH 상황에서 수동으로 남는 건 로컬 `~/.ssh/config`의 `RemoteForward` 한 줄과 **SSH 세션 재접속**(실행 중인 세션엔 터널을 소급 적용할 수 없음)뿐입니다 — [SSH로 원격 작업할 때](#ssh로-원격-작업할-때-예-ec2) 참고.
 
-**요구 사항:** `curl`과 Rust 컴파일용 C 링커 — `cc`/`clang`/`gcc`(macOS는 Xcode Command Line Tools: `xcode-select --install`, Linux는 `build-essential` 또는 `gcc`). Windows는 [Rust](https://rustup.rs) + 링커(VS Build Tools의 "C++를 사용한 데스크톱 개발")와, `settings.json` 자동 패치를 위한 Python(없으면 수동 추가할 JSON을 안내).
+**요구 사항:** `curl`과 Rust 컴파일용 C 링커 — `cc`/`clang`/`gcc`(macOS는 Xcode Command Line Tools: `xcode-select --install`, Linux는 `build-essential` 또는 `gcc`). Windows는 [Rust](https://rustup.rs) + 링커(VS Build Tools의 "C++를 사용한 데스크톱 개발")와 [Git for Windows](https://git-scm.com/downloads/win)(Claude Code 자체가 필요로 하며, 설치기는 그 Git Bash로 마지막 점검을 합니다). Windows PowerShell 5.1과 PowerShell 7 모두 되고, Python은 필요 없습니다.
 
 ### 설정 예시
 
@@ -51,10 +51,15 @@ irm https://raw.githubusercontent.com/kinggunil/claude-code-addons/main/install.
   **Claude Code의 권한 확인 프롬프트를 꺼 버리므로** 복사 전에 이해하고 쓰세요.
 
 **경로는 OS마다 다릅니다.** 예시는 macOS/Linux 형태(`$HOME/.claude/statusline-rs`,
-확장자 없음)입니다. Windows에서는 설치기가 `.exe` 절대경로로 씁니다(예:
-`C:\Users\you\.claude\statusline-rs.exe`, `claude-notify.exe`). 어느 쪽이든 설치기가
-그 머신에 맞는 경로를 알아서 채워 주며, 이 예시는 수동 설치용 참고일 뿐입니다.
-(파일 안의 `_` 로 시작하는 키는 주석이며, Claude Code는 모르는 키를 무시합니다.)
+확장자 없음)입니다. Windows에서는 설치기가 **따옴표로 감싼 슬래시(`/`) 절대경로**로
+씁니다(예: `"C:/Users/you/.claude/statusline-rs.exe"`). 이 형태가 중요합니다:
+Windows의 Claude Code는 상태줄과 훅 명령을 Git Bash로 실행하는데, bash는 따옴표
+밖의 역슬래시를 지워 버려서 `C:\Users\you\.claude\statusline-rs.exe`가
+`C:Usersyou.claudestatusline-rs.exe`("command not found")가 되고, 상태줄은 아무 에러
+없이 그냥 안 보입니다. Windows에서 `settings.json`을 손으로 고칠 때는 슬래시를 쓰거나
+경로를 따옴표로 감싸세요. 어느 쪽이든 설치기가 그 머신에 맞는 경로를 알아서 채워 주며,
+이 예시는 수동 설치용 참고일 뿐입니다. (파일 안의 `_` 로 시작하는 키는 주석이며,
+Claude Code는 모르는 키를 무시합니다.)
 
 ---
 
@@ -173,6 +178,13 @@ Host my-ec2
 
 상태줄과 `claude-notify`는 macOS에서 개발·엔드투엔드 테스트했습니다. Windows/Linux 경로는 각 OS의 네이티브 오디오 API를 따라 컴파일되지만 검증이 덜 되었습니다 — 문제가 있으면 알려주세요. ALSA가 없는 헤드리스 Linux 서버에서는 로컬 재생이 조용히 무시됩니다(그게 위의 SSH 원격 상황 — 터널/벨을 사용).
 
+**Windows 참고.** Windows의 Claude Code는 상태줄과 훅을 Git Bash로 실행하므로
+`settings.json`의 경로는 따옴표로 감싼 슬래시 형태여야 합니다(설치기가 그렇게 쓰고
+점검까지 합니다 — [설정 예시](#설정-예시) 참고). 손으로 고친 뒤 상태줄이 안 보이면 이
+경로 형태부터 확인하세요. `install-daemon`은 Windows에서 안내만 출력합니다: SSH 박스의
+알림을 받으려면 `claude-notify.exe listen --port 47291` 바로가기를 `shell:startup`에
+넣으세요.
+
 ---
 
 ## 제거
@@ -187,6 +199,15 @@ rm -rf ~/.claude/.claude-notify
 # 데몬을 설치했다면:
 launchctl unload ~/Library/LaunchAgents/com.kinggunil.claude-notify.plist  # macOS
 systemctl --user disable --now claude-notify.service                       # Linux
+```
+
+Windows(PowerShell):
+
+```powershell
+Remove-Item -Force -ErrorAction SilentlyContinue ~\.claude\claude-notify.exe, ~\.claude\claude-notify.rs,
+  ~\.claude\claude.wav, ~\.claude\statusline-rs.exe, ~\.claude\statusline.rs,
+  ~\.claude\.claude-notify.json, ~\.claude\.statusline-cpu.json
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue ~\.claude\.claude-notify
 ```
 
 ## 참고

@@ -37,7 +37,10 @@ toolchain via rustup if `rustc` is missing (macOS/Linux; on Windows install Rust
 yourself first), compiles both binaries into `~/.claude`, writes a default
 `~/.claude/.claude-notify.json`, and patches `~/.claude/settings.json` — adding
 the `statusLine` block **and** three `claude-notify` hooks. Existing settings are
-preserved and backed up to `settings.json.bak`; re-running is idempotent.
+preserved and backed up to `settings.json.bak`; re-running is idempotent. On
+Windows it finishes by running each command through Git Bash exactly as Claude
+Code does, so a bad path shows up as a red line in the installer output instead
+of as a status line that never appears.
 
 **It also configures the sound target for you.** The installer detects whether
 this machine has speakers or is a headless / SSH box and sets things up
@@ -58,8 +61,9 @@ gain the tunnel retroactively) — see [Using it over SSH](#using-it-over-ssh-eg
 **Requirements:** `curl` and a C linker for the Rust compile — `cc`/`clang`/`gcc`
 (Xcode Command Line Tools on macOS: `xcode-select --install`; `build-essential`
 or `gcc` on Linux). On Windows: [Rust](https://rustup.rs) + a linker (VS Build
-Tools "Desktop development with C++"), and Python for the automatic
-`settings.json` patch (otherwise the installer prints the JSON to add by hand).
+Tools "Desktop development with C++") and [Git for Windows](https://git-scm.com/downloads/win),
+which Claude Code itself needs — the installer uses its Git Bash for the final
+check. Windows PowerShell 5.1 and PowerShell 7 both work; no Python.
 
 ### Example config
 
@@ -77,10 +81,15 @@ Tools "Desktop development with C++"), and Python for the automatic
 
 **Paths are OS-specific.** The example uses the macOS/Linux form
 (`$HOME/.claude/statusline-rs`, no extension). On Windows the installer instead
-writes an absolute path with `.exe` (e.g. `C:\Users\you\.claude\statusline-rs.exe`
-and `claude-notify.exe`). Either way the installer fills in the correct path for
-your machine — the example is only a manual-setup reference. (The `_`-prefixed
-keys in the file are annotations; Claude Code ignores unknown keys.)
+writes a **quoted, forward-slash** absolute path with `.exe`, e.g.
+`"C:/Users/you/.claude/statusline-rs.exe"`. That form matters: Claude Code on
+Windows runs status line and hook commands through Git Bash, and bash drops
+unquoted backslashes, so `C:\Users\you\.claude\statusline-rs.exe` becomes
+`C:Usersyou.claudestatusline-rs.exe` → "command not found" → a status line that
+silently never shows. If you edit `settings.json` by hand on Windows, use forward
+slashes or wrap the path in quotes. Either way the installer fills in the correct
+path for your machine — the example is only a manual-setup reference. (The
+`_`-prefixed keys in the file are annotations; Claude Code ignores unknown keys.)
 
 ---
 
@@ -241,6 +250,14 @@ audio API but are less battle-tested — please report issues. On a headless Lin
 server without ALSA, local playback is a silent no-op (that's the SSH-remote case
 above — use the tunnel/bell).
 
+**Windows notes.** Claude Code on Windows runs the status line and hooks through
+Git Bash, so `settings.json` must hold quoted forward-slash paths (the installer
+writes them that way and checks them — see [Example config](#example-config)).
+If the status line never appears after a hand edit, that path form is the first
+thing to check. `install-daemon` only prints instructions on Windows: to receive
+chimes from SSH boxes, put a shortcut to `claude-notify.exe listen --port 47291`
+in `shell:startup`.
+
 ---
 
 ## Uninstall
@@ -256,6 +273,15 @@ rm -rf ~/.claude/.claude-notify
 # if you installed the daemon:
 launchctl unload ~/Library/LaunchAgents/com.kinggunil.claude-notify.plist  # macOS
 systemctl --user disable --now claude-notify.service                       # Linux
+```
+
+Windows (PowerShell):
+
+```powershell
+Remove-Item -Force -ErrorAction SilentlyContinue ~\.claude\claude-notify.exe, ~\.claude\claude-notify.rs,
+  ~\.claude\claude.wav, ~\.claude\statusline-rs.exe, ~\.claude\statusline.rs,
+  ~\.claude\.claude-notify.json, ~\.claude\.statusline-cpu.json
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue ~\.claude\.claude-notify
 ```
 
 ## Notes

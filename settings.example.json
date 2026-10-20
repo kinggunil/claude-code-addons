@@ -2,7 +2,7 @@
   "_note": "Reference ~/.claude/settings.json for github.com/kinggunil/claude-code-addons. Keys starting with '_' are annotations only — Claude Code ignores unknown keys, so you can leave or delete them when copying.",
 
   "_A_addon": "===== (A) claude-code-addons — the installer (install.sh / install.ps1) merges THESE into your real settings.json automatically; you don't add them by hand =====",
-  "_A_paths": "Paths below use the macOS/Linux form: $HOME/.claude + no file extension. On Windows the installer writes an absolute path with .exe instead, e.g. C:\\Users\\you\\.claude\\statusline-rs.exe and claude-notify.exe.",
+  "_A_paths": "Paths below use the macOS/Linux form: $HOME/.claude + no file extension. On Windows the installer writes a QUOTED forward-slash path with .exe instead, e.g. \"C:/Users/you/.claude/statusline-rs.exe\" — Claude Code runs these commands through Git Bash, which drops unquoted backslashes, so C:\\Users\\you\\... would silently fail (command not found, status line never shows).",
   "statusLine": {
     "type": "command",
     "command": "$HOME/.claude/statusline-rs",
