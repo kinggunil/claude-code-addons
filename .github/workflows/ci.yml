@@ -171,7 +171,9 @@ jobs:
           $orig = "{`n  `"model`": `"opus`",`n  `"env`": { `"GREETING`": `"안녕`" },`n  `"hooks`": { `"Stop`": [ { `"hooks`": [ { `"type`": `"command`", `"command`": `"echo mine`" } ] } ] }`n}`n"
           [IO.File]::WriteAllText($settings, $orig, $utf8)
 
-          $log = (& .\install.ps1 | Out-String)
+          # install.ps1 reports through Write-Host (the information stream), which a
+          # plain pipe does not carry: merge every stream into the pipe to read its log
+          $log = (& .\install.ps1 *>&1 | Out-String)
           Write-Host $log
           if ($log -match '(?m)^error:' -or $log -match 'FAILED') { throw 'first install reported a problem' }
           $d = [IO.File]::ReadAllText($settings) | ConvertFrom-Json
@@ -186,7 +188,7 @@ jobs:
           if ([IO.File]::ReadAllText("$settings.bak") -ne $orig) { throw 'backup is not the original file' }
           $first = [IO.File]::ReadAllText($settings)
 
-          $log = (& .\install.ps1 | Out-String)
+          $log = (& .\install.ps1 *>&1 | Out-String)
           Write-Host $log
           if ($log -match '(?m)^error:' -or $log -match 'FAILED') { throw 'second install reported a problem' }
           if ($log -notmatch 'already up to date') { throw 'second run rewrote settings.json' }
