@@ -36,8 +36,10 @@ The installer downloads the sources + the embedded voice, installs the Rust
 toolchain via rustup if `rustc` is missing (macOS/Linux; on Windows install Rust
 yourself first), compiles both binaries into `~/.claude`, writes a default
 `~/.claude/.claude-notify.json`, and patches `~/.claude/settings.json` — adding
-the `statusLine` block **and** three `claude-notify` hooks. Existing settings are
-preserved and backed up to `settings.json.bak`; re-running is idempotent. On
+the `statusLine` block **and** four `claude-notify` hooks. Existing settings are
+preserved; the file is rewritten, and backed up to `settings.json.bak`, only
+when something actually changes, so re-running is idempotent and never turns
+the backup into a copy of the already-patched file. On
 Windows it finishes by running each command through Git Bash exactly as Claude
 Code does, so a bad path shows up as a red line in the installer output instead
 of as a status line that never appears.
@@ -70,7 +72,7 @@ check. Windows PowerShell 5.1 and PowerShell 7 both work; no Python.
 [`settings.example.json`](settings.example.json) is a reference of a working
 `~/.claude/settings.json`, split into two labelled groups:
 
-- **(A) what the add-ons need** — the `statusLine` block and the three
+- **(A) what the add-ons need** — the `statusLine` block and the four
   `claude-notify` hooks. The installer merges *only these* into whatever settings
   you already have; you don't add them by hand.
 - **(B) the author's personal preferences** (`model`, `effortLevel`,
@@ -100,14 +102,14 @@ Two lines under the prompt, split by domain — your **Claude session** on top,
 
 ```
 Opus 4.8 (1M) · ⚡xhigh · think on | 🟢 █░░░░░░░░░ 126.5K/1M ( 12.7%) | 5h   9% ⏳3h 54m | 7d  23% used ·  5% over pace ( 8h24m) · ⏳5d 17h | 4h 31m · $2.74
-CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.10.20.3 | claude --resume <sid>
+CPU  10% · RAM  56% · VM  62% · 🏠 my-mac | mydir | v26.11.15 | claude --resume <sid>
 ```
 
 On an SSH session the host segment turns orange and switches icon, so the whole
 bottom line reads as "the box this session is really on":
 
 ```
-CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.3 | claude --resume <sid>
+CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.11.15 | claude --resume <sid>
 ```
 
 - **Line 1 — Claude session**: model, effort, thinking toggle, context gauge,
@@ -128,7 +130,15 @@ CPU  10% · RAM  56% · VM   0% · 🌐 ip-10-0-1-23 | mydir | v26.10.20.3 | cla
   `claude --resume` command at the far right.
 
 All stats come from direct syscalls (macOS `mach`/`sysctl`, Linux `/proc`,
-Windows `kernel32`) — no subprocesses, ~2–5 ms per refresh.
+Windows `kernel32`) — no subprocesses, ~2–5 ms per refresh. CPU counters are
+cached per session (`~/.claude/.statusline-cpu/<session>.json`), so several
+Claude Code sessions refreshing at once don't reset each other's measurement
+interval or slow each other down.
+
+The context count comes from the payload Claude Code sends: `total_input_tokens`,
+then `current_usage`, then `used_percentage`, each accepted only if it fits the
+window, so one bogus field falls through to the next instead of blanking the
+gauge. The transcript file is read only when none of them is usable.
 
 The host turns 🌐 when the shell descends from `sshd`/`mosh-server`/an SSM
 session or the box is an EC2 instance (DMI vendor or the default `ip-A-B-C-D`
@@ -168,7 +178,7 @@ Windows: `"command": "\"C:/Users/you/.claude/statusline-rs.exe\" --ascii"`.
 
 ```
 Fable 5.1, eff max, think on | [#.........] 136.8K/1M ( 13.6%) | 5h  11% ~0h 42m | 7d  33% used, 15% under pace (23h31m), ~3d 14h | 23h 13m, $539.75
-CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.10.20.3 | claude --resume <sid>
+CPU  16%, RAM  54%, VM  29%, ssh:ip-172-31-16-160 | accounts | v26.11.15 | claude --resume <sid>
 ```
 
 **Every value that changes between refreshes has a fixed width**, in both
@@ -191,7 +201,7 @@ In a 120-column window the lines above become:
 
 ```
 Fable 5.1 · ⚡max | 🟢 █░░░░░░░░░ 136.8K/1M ( 13.7%) | 5h  11% ⏳0h 41m | 7d  33% used · 16% under pace · ⏳3d 13h
-CPU  23% · RAM  78% · VM  77% · 🏠 my-mac | mydir | v26.10.20.3
+CPU  23% · RAM  78% · VM  77% · 🏠 my-mac | mydir | v26.11.15
 ```
 
 ---
@@ -204,7 +214,11 @@ CPU  23% · RAM  78% · VM  77% · 🏠 my-mac | mydir | v26.10.20.3
 |-------|------|-----------|
 | **Task completed** | `Stop` | plays only if the task took **≥ 60 s** (short tasks stay silent) |
 | **Waiting for your answer** | `PreToolUse` / `AskUserQuestion` | plays **immediately** |
+| **Waiting for a permission** | `Notification` / `permission_prompt` | plays **immediately** (never fires under `bypassPermissions`) |
 | (prompt submitted) | `UserPromptSubmit` | records the start time for the 60 s threshold |
+
+To also be chimed after a minute of idling at the prompt, widen the
+`Notification` matcher in `settings.json` to `permission_prompt|idle_prompt`.
 
 ### Configure — `~/.claude/.claude-notify.json`
 
@@ -224,7 +238,9 @@ No recompile, no hook edits — just change this file:
   Default `2.0`.
 - **`completed` / `question`** — the sound for each event: the built-in
   `claude`, or an **absolute path to your own 16-bit PCM `.wav`**. You can set
-  them differently.
+  them differently. On Windows write the path the way JSON requires, with
+  forward slashes or doubled backslashes: `C:/Users/you/ding.wav` or
+  `C:\\Users\\you\\ding.wav`.
 - **`remote`** — where to play (see below). `""` = play on this machine. The
   installer sets this automatically (`""` on a speaker machine, `127.0.0.1:47291`
   on a headless/SSH box); change it here to override.
@@ -240,6 +256,10 @@ claude-notify listen [--port 47291]                  # local playback daemon (se
 claude-notify install-daemon [--port 47291]          # keep the daemon running
 claude-notify --version
 ```
+
+Typed at a terminal, `play` doesn't wait for stdin (a hook always pipes its JSON
+payload in), so `claude-notify play` is the quickest way to hear the current
+config.
 
 ---
 
@@ -291,9 +311,12 @@ started on the headless box). If you ever need to set it by hand:
 
 Then **reconnect the SSH session** so the `RemoteForward` tunnel is active for it.
 
-Now when a long task finishes on the server, your **local machine speaks
-"claude"**. If the daemon is down or forwarding is disabled, you still get a
-terminal bell.
+Now when a long task finishes on the server, your **local machine plays its own
+`completed` sound**, and a question or permission prompt plays its `question`
+sound. The request carries only the event name; the daemon looks the sound up in
+the *local* machine's `.claude-notify.json`, so a remote box can never name a
+file on your machine. If the daemon is down or forwarding is disabled, you still
+get a terminal bell.
 
 **Bell only** (no daemon, zero setup): set `"remote": "bell"` on the server —
 it just rings your terminal / posts a desktop notification via the TTY.
@@ -330,17 +353,20 @@ in `shell:startup`.
 
 ## Uninstall
 
-Remove the `statusLine` block and the three `claude-notify` hooks from
+Remove the `statusLine` block and the four `claude-notify` hooks
+(`UserPromptSubmit`, `Stop`, `PreToolUse`, `Notification`) from
 `~/.claude/settings.json` (or restore `settings.json.bak`), then:
 
 ```sh
 rm -f ~/.claude/claude-notify ~/.claude/claude-notify.rs ~/.claude/claude.wav \
       ~/.claude/statusline-rs ~/.claude/statusline.rs ~/.claude/.claude-notify.json \
       ~/.claude/.statusline-cpu.json
-rm -rf ~/.claude/.claude-notify
+rm -rf ~/.claude/.claude-notify ~/.claude/.statusline-cpu
 # if you installed the daemon:
-launchctl unload ~/Library/LaunchAgents/com.kinggunil.claude-notify.plist  # macOS
-systemctl --user disable --now claude-notify.service                       # Linux
+launchctl unload ~/Library/LaunchAgents/com.kinggunil.claude-notify.plist \
+  && rm -f ~/Library/LaunchAgents/com.kinggunil.claude-notify.plist          # macOS
+systemctl --user disable --now claude-notify.service \
+  && rm -f ~/.config/systemd/user/claude-notify.service                       # Linux
 ```
 
 Windows (PowerShell):
@@ -349,13 +375,17 @@ Windows (PowerShell):
 Remove-Item -Force -ErrorAction SilentlyContinue ~\.claude\claude-notify.exe, ~\.claude\claude-notify.rs,
   ~\.claude\claude.wav, ~\.claude\statusline-rs.exe, ~\.claude\statusline.rs,
   ~\.claude\.claude-notify.json, ~\.claude\.statusline-cpu.json
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue ~\.claude\.claude-notify
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue ~\.claude\.claude-notify, ~\.claude\.statusline-cpu
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). The bundled `claude.wav` is macOS text-to-speech
+output, included as a convenience for personal use and not covered by that
+grant; point `completed` / `question` at your own `.wav` if that matters to you.
 
 ## Notes
 
-- The `claude` voice is macOS text-to-speech, bundled as convenience audio for
-  personal use.
 - Only `~/.claude/settings.json` (statusLine + hooks) has to exist on each
   machine; the installer handles it. Everything else is machine-local.
 - Bump `VERSION` in each `.rs` on changes so the status line's on-screen tag

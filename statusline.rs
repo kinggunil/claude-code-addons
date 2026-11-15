@@ -12,9 +12,10 @@
 //   it through Git Bash, which drops unquoted backslashes: C:\Users\you\... would become
 //   C:Usersyou... ("command not found") and the status line would silently never show.
 //
-// Reads Claude Code's JSON on stdin and prints a two-line colored status bar:
-//   line 1 (dim):  claude --resume <sid> | elapsed | cost | rate limits
-//   line 2 (live): model | effort | think | dir | context gauge | CPU | RAM | VM | version
+// Reads Claude Code's JSON on stdin and prints a two-line colored status bar,
+// split by domain:
+//   line 1 (Claude session): model · effort · think | context gauge | 5h | 7d pace | elapsed · cost
+//   line 2 (this machine):   CPU · RAM · VM · host | dir | version | claude --resume <sid>
 //
 // Zero subprocess spawns: macOS stats via mach host_statistics/host_statistics64
 //   + sysctlbyname FFI, Linux via /proc, Windows via kernel32.
@@ -40,14 +41,18 @@
 //   `--width N` (or STATUSLINE_WIDTH) overrides; 0 disables fitting.
 //
 // CPU% is the average load since the previous refresh: cumulative kernel counters
-// are cached in ~/.claude/.statusline-cpu.json. First run falls back to a 0.1 s
-// inline sample. Counters reset on reboot are detected and discarded.
+// are cached per session in ~/.claude/.statusline-cpu/<session>.json, so parallel
+// sessions don't reset each other's measurement interval (files untouched for a
+// day are swept when a new session starts). A session's first run falls back to
+// a 0.1 s inline sample. Counters reset on reboot are detected and discarded.
 //
-// Context tokens: the last message's usage in the transcript tail (input +
-// cache_read + cache_creation == tokens actually sent == current context, always
-// <= the window). The harness context_window.* fields are sometimes cumulative
-// garbage on long sessions (e.g. "4457.1K/1M"), so they are only a
-// sanity-checked fallback; displayed tokens and % come from the same number.
+// Context tokens, in order of preference: context_window.total_input_tokens (the
+// harness's "tokens currently in the window"), then context_window.current_usage
+// (the same count broken out: input + cache_creation + cache_read), then the
+// pre-rounded context_window.used_percentage, then the last message's usage in
+// the transcript tail. Each is accepted only if it fits the window, so one bogus
+// field falls through to the next instead of blanking the gauge; displayed tokens
+// and % always come from the same number.
 
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -61,7 +66,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // each further same-day revision (so a newer same-day build sorts after an
 // older one). Date-based means a glance tells you how old a build is without
 // looking anything up.
-const VERSION: &str = "26.10.20.3";
+const VERSION: &str = "26.11.15";
 
 // ---------------- ANSI palette ----------------
 const RESET: &str = "\x1b[0m";
@@ -1312,21 +1317,72 @@ fn delta_pct(p: (u64, u64), c: (u64, u64)) -> Option<f64> {
     }
 }
 
-/// Busy% averaged since the previous run, via counters cached in the state file.
+/// Where this session caches its CPU counters: one file per Claude Code session
+/// under ~/.claude/.statusline-cpu/. A single shared file meant two sessions
+/// refreshing at once kept resetting each other's interval, which pushed every
+/// other run onto the 100 ms inline-sample path (30 ms → 145 ms per refresh).
+fn cpu_state_path(sid: &str) -> PathBuf {
+    let safe: String = sid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = if safe.is_empty() { "anon" } else { safe.as_str() };
+    home()
+        .join(".claude")
+        .join(".statusline-cpu")
+        .join(format!("{}.json", name))
+}
+
+/// Delete state files no session has touched for `max_age` (sessions that have
+/// ended). Called only when a session writes its first file, so the steady state
+/// costs nothing.
+fn sweep_cpu_state(dir: &Path, max_age: Duration) {
+    let now = SystemTime::now();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map_or(false, |age| age > max_age);
+        if stale {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// Busy% averaged since the previous run, via counters cached in this session's
+/// state file.
 ///
 /// Always returns Some — never blanks the CPU segment. On some platforms
 /// (observed on Apple Silicon) the underlying tick counter only advances at
 /// roughly 1 Hz, coarser than this binary's own refresh cadence, so two
 /// samples taken well under a second apart routinely read back identical
 /// counters (a zero delta, not an error). Rather than surface that as
-/// "unknown" and flicker the segment away, fall back to the last computed
-/// percentage (cached alongside the counters), and only default to 0% if
-/// there is truly no prior data (first run ever).
-fn cpu_percent() -> Option<f64> {
-    let state_path = home().join(".claude").join(".statusline-cpu.json");
+/// "unknown" and flicker the segment away, or stall the refresh on an inline
+/// sample, fall back to the last computed percentage (cached alongside the
+/// counters). Only a session's very first run, with nothing to compare
+/// against, takes a 0.1 s inline sample.
+fn cpu_percent(sid: &str) -> Option<f64> {
+    let state_path = cpu_state_path(sid);
     let cached = fs::read_to_string(&state_path)
         .ok()
         .and_then(|t| parse(t.trim()).ok());
+    let first_run = cached.is_none();
     let last_pct = cached.as_ref().and_then(|st| st.get("pct")).and_then(Json::as_f64);
 
     let cur = match plat::cpu_counters() {
@@ -1354,16 +1410,28 @@ fn cpu_percent() -> Option<f64> {
 
     let pct = prev
         .and_then(|p| delta_pct(p, cur))
+        // no usable delta (sample too close, or the ticks haven't moved): keep
+        // showing the last value rather than stall this refresh
+        .or(last_pct)
+        // first run of this session, nothing to compare against: one inline sample
         .or_else(|| {
             std::thread::sleep(Duration::from_millis(100));
             plat::cpu_counters().and_then(|c2| delta_pct(cur, c2))
         })
-        .or(last_pct)
         .unwrap_or(0.0);
 
+    if first_run {
+        if let Some(dir) = state_path.parent() {
+            let _ = fs::create_dir_all(dir);
+            sweep_cpu_state(dir, Duration::from_secs(86_400));
+        }
+        // the single shared file older builds used
+        let _ = fs::remove_file(home().join(".claude").join(".statusline-cpu.json"));
+    }
+
     // save current sample + the pct we're reporting, for next run's fallback
-    // (atomic replace; tmp name includes our pid so concurrent Claude Code
-    // sessions/tabs writing at the same instant don't tear each other's write)
+    // (atomic replace; tmp name includes our pid so two runs of one session
+    // writing at the same instant don't tear each other's write)
     let tmp = PathBuf::from(format!("{}.{}.tmp", state_path.display(), std::process::id()));
     if fs::write(
         &tmp,
@@ -1637,6 +1705,79 @@ fn bar(pct: f64, width: usize, g: &Glyphs) -> String {
     )
 }
 
+// ---------------- context window ----------------
+
+/// Tokens in the context window, from the harness payload: total_input_tokens,
+/// else current_usage (input + cache_creation + cache_read), else used_percentage
+/// of the window. Each is accepted only when it fits the window — a field can
+/// occasionally report a bogus, out-of-range value — so one bad field falls
+/// through to the next instead of blanking the gauge. 0 when nothing is usable.
+/// The percent shown is later derived from this raw count, keeping its decimals
+/// (the pre-rounded integer `used_percentage` is the last choice for that reason).
+fn context_tokens(cw: Option<&Json>, max_ctx: u64) -> u64 {
+    let cw = match cw {
+        Some(c) => c,
+        None => return 0,
+    };
+    let fits = |v: f64| v > 0.0 && (v as u64) <= max_ctx;
+    if let Some(v) = cw.get("total_input_tokens").and_then(Json::as_f64) {
+        if fits(v) {
+            return v as u64;
+        }
+    }
+    if let Some(u) = cw.get("current_usage") {
+        let g = |k: &str| u.get(k).and_then(Json::as_f64).unwrap_or(0.0);
+        let v = g("input_tokens") + g("cache_creation_input_tokens") + g("cache_read_input_tokens");
+        if fits(v) {
+            return v as u64;
+        }
+    }
+    if let Some(p) = cw.get("used_percentage").and_then(Json::as_f64) {
+        if p > 0.0 && p <= 100.0 {
+            return (p / 100.0 * max_ctx as f64).round() as u64;
+        }
+    }
+    0
+}
+
+/// Last resort for the context count: the usage block of the last message in
+/// the transcript tail (input + cache_read + cache_creation == tokens actually
+/// sent == current context). Reads at most the final 256 KB; 0 when the file or
+/// a usage block isn't there. Covers older Claude Code builds that send no
+/// context_window at all.
+fn transcript_context_tokens(path: &str) -> u64 {
+    let mut f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let len = match f.seek(SeekFrom::End(0)) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    if f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).is_err() {
+        return 0;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return 0;
+    }
+    let tail = String::from_utf8_lossy(&buf);
+    for ln in tail.lines().rev() {
+        let ln = ln.trim();
+        if ln.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = parse(ln) {
+            if let Some(u) = obj.path(&["message", "usage"]) {
+                let g = |k: &str| u.get(k).and_then(Json::as_f64).unwrap_or(0.0);
+                return (g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens"))
+                    as u64;
+            }
+        }
+    }
+    0
+}
+
 // ---------------- main ----------------
 
 fn main() {
@@ -1713,53 +1854,11 @@ fn main() {
         max_ctx.to_string()
     };
 
-    // primary: harness-provided token count — no file I/O, always current. Accepted
-    // only when it fits the window (this field can occasionally report a bogus,
-    // out-of-range value, which is why it stays guarded). The percent is still
-    // derived from this raw count below, so decimal precision is preserved (we do
-    // NOT use the pre-rounded integer `used_percentage`).
-    let mut ctx_tokens: u64 = 0;
-    if let Some(v) = cw
-        .and_then(|c| c.get("total_input_tokens"))
-        .and_then(Json::as_f64)
-    {
-        if v > 0.0 && (v as u64) <= max_ctx {
-            ctx_tokens = v as u64;
-        }
-    }
-    // fallback: last message's usage from the transcript tail — covers older Claude
-    // Code builds that don't send context_window, or a rejected value above. Only
-    // runs when the payload count is absent, so the normal path does no file I/O.
+    // the harness payload first (no file I/O, always current), the transcript
+    // only when every payload field is absent or rejected
+    let mut ctx_tokens = context_tokens(cw, max_ctx);
     if ctx_tokens == 0 && !transcript.is_empty() {
-        if let Ok(mut f) = fs::File::open(transcript) {
-            if let Ok(len) = f.seek(SeekFrom::End(0)) {
-                let start = len.saturating_sub(256 * 1024);
-                if f.seek(SeekFrom::Start(start)).is_ok() {
-                    let mut buf = Vec::new();
-                    if f.read_to_end(&mut buf).is_ok() {
-                        let tail = String::from_utf8_lossy(&buf);
-                        for ln in tail.lines().rev() {
-                            let ln = ln.trim();
-                            if ln.is_empty() {
-                                continue;
-                            }
-                            if let Ok(obj) = parse(ln) {
-                                if let Some(u) = obj.path(&["message", "usage"]) {
-                                    let g = |k: &str| {
-                                        u.get(k).and_then(Json::as_f64).unwrap_or(0.0)
-                                    };
-                                    ctx_tokens = (g("input_tokens")
-                                        + g("cache_read_input_tokens")
-                                        + g("cache_creation_input_tokens"))
-                                        as u64;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        ctx_tokens = transcript_context_tokens(transcript);
     }
 
     let cost_usd = d
@@ -1896,7 +1995,7 @@ fn main() {
     // machine sector first, live meters leading: CPU · RAM · VM at the very left
     // edge (first-read anchor), then host (🏠 local / 🌐 SSH remote)
     let mut machine = Sector::new(&dot);
-    let cpu = cpu_percent();
+    let cpu = cpu_percent(sid);
     let (ram, vm) = plat::mem();
     for (label, val, rank) in [("CPU", cpu, R_CPU), ("RAM", ram, R_RAM), ("VM", vm, R_VM)] {
         if let Some(v) = val {
@@ -1996,6 +2095,70 @@ mod tests {
         let ctx = (g("input_tokens") + g("cache_read_input_tokens")
             + g("cache_creation_input_tokens")) as u64;
         assert_eq!(ctx, 126_510);
+    }
+
+    #[test]
+    fn context_tokens_fall_through_bad_fields() {
+        let max = 1_000_000;
+        let j = |s: &str| parse(s).unwrap();
+        // the usual case: total_input_tokens fits the window and wins
+        let a = j(r#"{"total_input_tokens":136779,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":8000,"cache_read_input_tokens":112000},"used_percentage":12}"#);
+        assert_eq!(context_tokens(Some(&a), max), 136_779);
+        // an out-of-range total falls through to current_usage, not to a blank gauge
+        let b = j(r#"{"total_input_tokens":4457100,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":8000,"cache_read_input_tokens":112000},"used_percentage":12}"#);
+        assert_eq!(context_tokens(Some(&b), max), 120_002);
+        // current_usage is null right after /compact: the pre-rounded percentage then
+        let c = j(r#"{"total_input_tokens":0,"current_usage":null,"used_percentage":12}"#);
+        assert_eq!(context_tokens(Some(&c), max), 120_000);
+        // nothing usable
+        assert_eq!(context_tokens(Some(&j(r#"{"total_input_tokens":0}"#)), max), 0);
+        assert_eq!(context_tokens(Some(&j(r#"{"used_percentage":250}"#)), max), 0);
+        assert_eq!(context_tokens(None, max), 0);
+    }
+
+    #[test]
+    fn transcript_tail_is_the_last_resort() {
+        let p = std::env::temp_dir().join(format!("sl-transcript-{}.jsonl", std::process::id()));
+        fs::write(
+            &p,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":117727,\"cache_creation_input_tokens\":8781,\"output_tokens\":1845}}}\n",
+                "{\"type\":\"progress\"}\n",
+                "not json at all\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(transcript_context_tokens(p.to_str().unwrap()), 126_510);
+        let _ = fs::remove_file(&p);
+        assert_eq!(transcript_context_tokens("/definitely/not/here.jsonl"), 0);
+    }
+
+    #[test]
+    fn cpu_state_is_per_session_and_swept() {
+        assert_ne!(cpu_state_path("abc-123"), cpu_state_path("other"));
+        assert!(cpu_state_path("abc-123").ends_with(Path::new(".statusline-cpu").join("abc-123.json")));
+        assert_eq!(cpu_state_path("").file_name().unwrap(), "anon.json");
+        assert_eq!(cpu_state_path("a/b").file_name().unwrap(), "a_b.json");
+        // the sweep removes only stale .json files
+        let dir = std::env::temp_dir().join(format!("sl-cpu-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("gone.json");
+        let fresh = dir.join("live.json");
+        let other = dir.join("live.json.123.tmp");
+        for p in [&stale, &fresh, &other] {
+            fs::write(p, "{}").unwrap();
+        }
+        let long_ago = SystemTime::now() - Duration::from_secs(3 * 86_400);
+        for p in [&stale, &other] {
+            fs::File::options().write(true).open(p).unwrap().set_modified(long_ago).unwrap();
+        }
+        sweep_cpu_state(&dir, Duration::from_secs(86_400));
+        assert!(!stale.exists(), "stale state should be gone");
+        assert!(fresh.exists(), "fresh state must survive");
+        assert!(other.exists(), "only .json files are touched");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

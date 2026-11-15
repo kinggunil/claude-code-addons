@@ -15,6 +15,11 @@
 # Everything runs inside one script block: nothing leaks into your session, and
 # a failure stops with an error message instead of closing the window (a bare
 # 'exit' under 'irm | iex' would end your whole PowerShell session).
+#
+# Knobs (environment variables), mainly for CI and offline installs:
+#   CCA_LOCAL_SRC=<dir>   copy statusline.rs / claude-notify.rs / claude.wav from
+#                         this directory instead of downloading them
+#   CCA_NO_DAEMON=1       don't start the playback daemon on a speaker machine
 
 & {
 $ErrorActionPreference = 'Stop'
@@ -190,9 +195,14 @@ try {
 
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   Write-Host '==> fetching sources'
-  Invoke-WebRequest -UseBasicParsing "$repo/statusline.rs"    -OutFile $slSrc
-  Invoke-WebRequest -UseBasicParsing "$repo/claude-notify.rs" -OutFile $cnSrc
-  Invoke-WebRequest -UseBasicParsing "$repo/claude.wav"       -OutFile $wav
+  foreach ($f in 'statusline.rs', 'claude-notify.rs', 'claude.wav') {
+    $dest = Join-Path $dir $f
+    if ($env:CCA_LOCAL_SRC) {
+      Copy-Item -LiteralPath (Join-Path $env:CCA_LOCAL_SRC $f) -Destination $dest -Force
+    } else {
+      Invoke-WebRequest -UseBasicParsing "$repo/$f" -OutFile $dest
+    }
+  }
 
   $build = Join-Path ([IO.Path]::GetTempPath()) ('claude-addons-build-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $build | Out-Null
@@ -214,14 +224,19 @@ try {
   }
 
   # speaker machine (local desktop): start the playback daemon automatically
-  if (-not $remote) {
+  if (-not $remote -and -not $env:CCA_NO_DAEMON) {
     Write-Host '==> starting playback daemon (this machine has speakers)'
     try { & $cnBin install-daemon } catch { Write-Host "    (run '$cnBin install-daemon' manually)" }
   }
 
-  # ---- settings.json: statusLine block + three claude-notify hooks ----
+  # ---- settings.json: statusLine block + four claude-notify hooks ----
+  # Idempotent: a hook is added only if the event has no claude-notify hook yet,
+  # and the file is rewritten (and backed up to settings.json.bak) only when
+  # something actually changed, so a re-run never turns the backup into a copy
+  # of the already-patched file.
   Write-Host '==> updating settings.json'
   $conf = [pscustomobject]@{}
+  $existed = $false
   if (Test-Path -LiteralPath $settings -PathType Leaf) {
     $raw = [IO.File]::ReadAllText($settings)
     if ($raw.Trim()) {
@@ -243,14 +258,14 @@ try {
       if ($conf -isnot [System.Management.Automation.PSCustomObject]) {
         throw 'existing settings.json is not a JSON object; left it untouched.'
       }
-      Copy-Item -LiteralPath $settings -Destination "$settings.bak" -Force
-      Write-Host "    backup: $settings.bak"
+      $existed = $true
     }
   }
   if ($conf.PSObject.Properties['hooks'] -and $null -ne $conf.hooks -and
       $conf.hooks -isnot [System.Management.Automation.PSCustomObject]) {
     throw "'hooks' in settings.json is not a JSON object; left the file untouched."
   }
+  $before = ConvertTo-JsonText $conf
   $slCmd = ConvertTo-BashPath $slBin
   $cnCmd = ConvertTo-BashPath $cnBin
   Set-JsonProperty $conf 'statusLine' ([pscustomobject]@{ type = 'command'; command = $slCmd; refreshInterval = 1 })
@@ -258,7 +273,17 @@ try {
   Add-NotifyHook $conf.hooks 'UserPromptSubmit' "$cnCmd mark" ' mark' ''
   Add-NotifyHook $conf.hooks 'Stop' "$cnCmd play --event completed --threshold 60" '--event completed' ''
   Add-NotifyHook $conf.hooks 'PreToolUse' "$cnCmd play --event question" '--event question' 'AskUserQuestion'
-  [IO.File]::WriteAllText($settings, (ConvertTo-JsonText $conf) + "`n", $utf8)
+  Add-NotifyHook $conf.hooks 'Notification' "$cnCmd play --event question" '--event question' 'permission_prompt'
+  $after = ConvertTo-JsonText $conf
+  if ($existed -and $after -eq $before) {
+    Write-Host '    already up to date (left untouched)'
+  } else {
+    if ($existed) {
+      Copy-Item -LiteralPath $settings -Destination "$settings.bak" -Force
+      Write-Host "    backup: $settings.bak"
+    }
+    [IO.File]::WriteAllText($settings, $after + "`n", $utf8)
+  }
   $conf = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($settings))   # what Claude Code will read
   Write-Host "    statusLine: $($conf.statusLine.command)"
 

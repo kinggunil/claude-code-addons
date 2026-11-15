@@ -11,8 +11,10 @@
 // "remote":"127.0.0.1:<port>" in ~/.claude/.claude-notify.json there. The play
 // hook then hands the request to a `claude-notify listen` daemon on the machine
 // with speakers, reached through an SSH RemoteForward tunnel (rides the existing
-// SSH connection — no extra ports, firewall-immune). If the tunnel/daemon isn't
-// reachable it falls back to a terminal BEL/OSC over the TTY, which works
+// SSH connection — no extra ports, firewall-immune). The request names only the
+// event (completed / question); the daemon picks the sound from its *own* config,
+// so a remote box can never point this machine at a file. If the tunnel/daemon
+// isn't reachable it falls back to a terminal BEL/OSC over the TTY, which works
 // whenever you have an SSH session. "remote":"bell" forces the bell-only path;
 // "" (default) plays locally.
 //
@@ -24,18 +26,20 @@
 //   play                    play now (local, remote, or bell per config)
 //   play --threshold 60     play only if >=60s since this session's mark (Stop hook)
 //   play --event question   pick the question sound instead of completed
+//                           (PreToolUse/AskUserQuestion + Notification/permission_prompt hooks)
 //   listen [--port 47291]   run the local playback daemon (machine with speakers)
 //   install-daemon [--port] keep `listen` running (macOS launchd / Linux systemd)
 // Options: --vol <f> volume, --sound <name|path>, --remote <host:port|bell|"">.
 // Session id is read from the hook JSON on stdin so parallel sessions don't
-// clobber each other's start marker.
+// clobber each other's start marker. stdin is skipped when it is a terminal, so
+// `claude-notify play` typed at a prompt plays at once instead of waiting for input.
 
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "26.07.05.16";
+const VERSION: &str = "26.11.15";
 
 // The only embedded sound: the default voice saying "claude", pre-rendered TTS
 // baked to 16-bit PCM WAV, so no speech engine is needed at runtime and it
@@ -144,6 +148,247 @@ fn play_sound(name: &str, vol: f32) {
     }
 }
 
+// ---------------- minimal JSON (config file + hook payload) ----------------
+// A real parser rather than substring scanning, so a Windows path written the
+// only way JSON allows ("C:\\Users\\me\\ding.wav") comes back as
+// C:\Users\me\ding.wav, and a prompt that happens to quote "session_id" can't
+// be mistaken for the key.
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+impl Json {
+    fn get(&self, key: &str) -> Option<&Json> {
+        match self {
+            Json::Obj(m) => m.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+fn parse_json(s: &str) -> Option<Json> {
+    let mut p = P {
+        b: s.as_bytes(),
+        i: 0,
+    };
+    p.ws();
+    let v = p.value()?;
+    p.ws();
+    if p.i != p.b.len() {
+        return None; // trailing garbage
+    }
+    Some(v)
+}
+
+struct P<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> P<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+    fn ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+    fn value(&mut self) -> Option<Json> {
+        match self.peek()? {
+            b'{' => self.obj(),
+            b'[' => self.arr(),
+            b'"' => self.string().map(Json::Str),
+            b't' => self.lit(b"true", Json::Bool(true)),
+            b'f' => self.lit(b"false", Json::Bool(false)),
+            b'n' => self.lit(b"null", Json::Null),
+            _ => self.num(),
+        }
+    }
+    fn lit(&mut self, w: &[u8], v: Json) -> Option<Json> {
+        if self.b[self.i..].starts_with(w) {
+            self.i += w.len();
+            Some(v)
+        } else {
+            None
+        }
+    }
+    fn obj(&mut self) -> Option<Json> {
+        self.i += 1; // '{'
+        let mut m = Vec::new();
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.i += 1;
+            return Some(Json::Obj(m));
+        }
+        loop {
+            self.ws();
+            if self.peek() != Some(b'"') {
+                return None;
+            }
+            let k = self.string()?;
+            self.ws();
+            if self.peek() != Some(b':') {
+                return None;
+            }
+            self.i += 1;
+            self.ws();
+            let v = self.value()?;
+            m.push((k, v));
+            self.ws();
+            match self.peek() {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
+                    self.i += 1;
+                    return Some(Json::Obj(m));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn arr(&mut self) -> Option<Json> {
+        self.i += 1; // '['
+        let mut a = Vec::new();
+        self.ws();
+        if self.peek() == Some(b']') {
+            self.i += 1;
+            return Some(Json::Arr(a));
+        }
+        loop {
+            self.ws();
+            a.push(self.value()?);
+            self.ws();
+            match self.peek() {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Some(Json::Arr(a));
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn string(&mut self) -> Option<String> {
+        self.i += 1; // opening quote
+        let mut s = String::new();
+        let mut start = self.i;
+        loop {
+            let c = self.peek()?;
+            if c == b'"' {
+                s.push_str(std::str::from_utf8(&self.b[start..self.i]).ok()?);
+                self.i += 1;
+                return Some(s);
+            } else if c == b'\\' {
+                s.push_str(std::str::from_utf8(&self.b[start..self.i]).ok()?);
+                self.i += 1;
+                let e = self.peek()?;
+                self.i += 1;
+                match e {
+                    b'"' => s.push('"'),
+                    b'\\' => s.push('\\'),
+                    b'/' => s.push('/'),
+                    b'b' => s.push('\u{8}'),
+                    b'f' => s.push('\u{c}'),
+                    b'n' => s.push('\n'),
+                    b'r' => s.push('\r'),
+                    b't' => s.push('\t'),
+                    b'u' => {
+                        let u1 = self.hex4()?;
+                        let cp = if (0xD800..0xDC00).contains(&u1) {
+                            // high surrogate: must be followed by \uDC00-\uDFFF
+                            if self.peek() != Some(b'\\') || self.b.get(self.i + 1) != Some(&b'u') {
+                                return None;
+                            }
+                            self.i += 2;
+                            let u2 = self.hex4()?;
+                            if !(0xDC00..0xE000).contains(&u2) {
+                                return None;
+                            }
+                            0x10000 + ((u1 - 0xD800) << 10) + (u2 - 0xDC00)
+                        } else if (0xDC00..0xE000).contains(&u1) {
+                            return None; // lone low surrogate
+                        } else {
+                            u1
+                        };
+                        s.push(char::from_u32(cp)?);
+                    }
+                    _ => return None,
+                }
+                start = self.i;
+            } else {
+                self.i += 1; // raw byte (multi-byte UTF-8 passes through untouched)
+            }
+        }
+    }
+    fn hex4(&mut self) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let c = self.peek()?;
+            self.i += 1;
+            v = v * 16
+                + match c {
+                    b'0'..=b'9' => (c - b'0') as u32,
+                    b'a'..=b'f' => (c - b'a' + 10) as u32,
+                    b'A'..=b'F' => (c - b'A' + 10) as u32,
+                    _ => return None,
+                };
+        }
+        Some(v)
+    }
+    fn num(&mut self) -> Option<Json> {
+        let start = self.i;
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+        }
+        if self.i == start {
+            return None;
+        }
+        std::str::from_utf8(&self.b[start..self.i])
+            .ok()?
+            .parse::<f64>()
+            .ok()
+            .map(Json::Num)
+    }
+}
+
 // ---------------- user config (~/.claude/.claude-notify.json) ----------------
 
 /// What to play for each event, how loud, and where. `remote`:
@@ -158,42 +403,43 @@ struct Cfg {
     remote: String,
 }
 
-/// Pull a bare number field ("vol": 1.5) out of the small config JSON.
-fn extract_num(json: &str, key: &str) -> Option<f64> {
-    let pat = format!("\"{}\"", key);
-    let idx = json.find(&pat)? + pat.len();
-    let rest = &json[idx..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    let num: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
-        .collect();
-    num.parse().ok()
+impl Cfg {
+    fn defaults() -> Cfg {
+        Cfg {
+            vol: 2.0,
+            completed: "claude".to_string(),
+            question: "claude".to_string(),
+            remote: String::new(),
+        }
+    }
 }
 
-fn read_cfg() -> Cfg {
-    let mut cfg = Cfg {
-        vol: 2.0,
-        completed: "claude".to_string(),
-        question: "claude".to_string(),
-        remote: String::new(),
-    };
-    if let Ok(s) = fs::read_to_string(home().join(".claude").join(".claude-notify.json")) {
-        if let Some(v) = extract_num(&s, "vol") {
+/// Config from its JSON text. Any field that is missing or of the wrong type
+/// keeps its default; unparsable text keeps every default, so a typo in the
+/// file never makes the chime go silent.
+fn cfg_from_json(s: &str) -> Cfg {
+    let mut cfg = Cfg::defaults();
+    if let Some(j) = parse_json(s.trim()) {
+        if let Some(v) = j.get("vol").and_then(Json::as_f64) {
             cfg.vol = v as f32;
         }
-        if let Some(c) = extract_str(&s, "completed") {
-            cfg.completed = c;
+        if let Some(c) = j.get("completed").and_then(Json::as_str) {
+            cfg.completed = c.to_string();
         }
-        if let Some(q) = extract_str(&s, "question") {
-            cfg.question = q;
+        if let Some(q) = j.get("question").and_then(Json::as_str) {
+            cfg.question = q.to_string();
         }
-        if let Some(r) = extract_str(&s, "remote") {
-            cfg.remote = r;
+        if let Some(r) = j.get("remote").and_then(Json::as_str) {
+            cfg.remote = r.to_string();
         }
     }
     cfg
+}
+
+fn read_cfg() -> Cfg {
+    fs::read_to_string(home().join(".claude").join(".claude-notify.json"))
+        .map(|s| cfg_from_json(&s))
+        .unwrap_or_else(|_| Cfg::defaults())
 }
 
 // ---------------- per-session start marker (long-task threshold) ----------------
@@ -220,44 +466,90 @@ fn write_marker(sid: &str) {
     let p = marker_path(sid);
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
+        prune_old_markers(dir, Duration::from_secs(7 * 86_400));
     }
     let _ = fs::write(&p, format!("{{\"t\":{:.3}}}", now_secs()));
 }
 
-fn read_marker(sid: &str) -> Option<f64> {
-    let s = fs::read_to_string(marker_path(sid)).ok()?;
-    let idx = s.find("\"t\"")? + 3;
-    let rest = &s[idx..];
-    let colon = rest.find(':')?;
-    let after = rest[colon + 1..].trim_start();
-    let num: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    num.parse().ok()
+/// Markers are one file per session and nothing else ever deletes them, so drop
+/// the ones no session has touched for `max_age` (a prompt refreshes its own).
+/// Runs on every `mark`; the directory holds a few dozen entries at most.
+fn prune_old_markers(dir: &Path, max_age: Duration) {
+    let now = SystemTime::now();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map_or(false, |age| age > max_age);
+        if stale {
+            let _ = fs::remove_file(&p);
+        }
+    }
 }
 
-/// Pull a string field out of the hook JSON without a full parser (values here
-/// never contain escaped quotes).
-fn extract_str(json: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{}\"", key);
-    let idx = json.find(&pat)? + pat.len();
-    let rest = &json[idx..];
-    let colon = rest.find(':')?;
-    let after = &rest[colon + 1..];
-    let q = after.find('"')?;
-    let s = &after[q + 1..];
-    let end = s.find('"')?;
-    Some(s[..end].to_string())
+fn read_marker(sid: &str) -> Option<f64> {
+    let s = fs::read_to_string(marker_path(sid)).ok()?;
+    parse_json(s.trim())?.get("t")?.as_f64()
+}
+
+/// The session id from a hook payload, or None when there is no (valid) payload.
+fn session_id(hook_json: &str) -> Option<String> {
+    parse_json(hook_json.trim())?
+        .get("session_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Is stdin a terminal (someone typed the command) rather than the pipe Claude
+/// Code hands a hook? Then there is no payload to wait for.
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(0) == 1 }
+}
+
+#[cfg(windows)]
+fn stdin_is_tty() -> bool {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+    let mut mode = 0u32;
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        !h.is_null() && GetConsoleMode(h, &mut mode) != 0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stdin_is_tty() -> bool {
+    false
 }
 
 // ---------------- remote playback (SSH-tunnel daemon) + bell fallback ----------------
 
 /// Hand the play request to a claude-notify daemon at `addr` (host:port), usually
 /// 127.0.0.1:<port> reached through an SSH RemoteForward tunnel back to the
-/// machine with speakers. Short timeouts so a missing daemon never hangs a hook.
-/// Returns true only if the request was delivered.
-fn send_remote(addr: &str, sound: &str, vol: f32) -> bool {
+/// machine with speakers. The wire format is one line, "play\t<event>\t<vol>":
+/// the event name, never a sound path, so the daemon's own config decides what
+/// plays. Short timeouts so a missing daemon never hangs a hook. Returns true
+/// only if the request was delivered.
+fn send_remote(addr: &str, event: &str, vol: f32) -> bool {
     use std::io::Write;
     use std::net::{TcpStream, ToSocketAddrs};
     let addrs = match addr.to_socket_addrs() {
@@ -268,7 +560,7 @@ fn send_remote(addr: &str, sound: &str, vol: f32) -> bool {
         if let Ok(mut s) = TcpStream::connect_timeout(&sa, Duration::from_millis(500)) {
             let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
             if s
-                .write_all(format!("play\t{}\t{}\n", sound, vol).as_bytes())
+                .write_all(format!("play\t{}\t{}\n", event, vol).as_bytes())
                 .is_ok()
             {
                 let _ = s.flush();
@@ -281,12 +573,17 @@ fn send_remote(addr: &str, sound: &str, vol: f32) -> bool {
 
 /// Ring the local terminal over the SSH TTY — works whenever you have an SSH
 /// session, no ports, immune to firewall/forwarding config. BEL rings the bell;
-/// OSC 9 adds a desktop notification on terminals that support it (e.g. iTerm2).
-/// Written to the controlling terminal so Claude Code doesn't swallow it as
-/// captured hook stdout.
-fn bell() {
+/// OSC 9 adds a desktop notification on terminals that support it (e.g. iTerm2),
+/// worded for the event. Written to the controlling terminal so Claude Code
+/// doesn't swallow it as captured hook stdout.
+fn bell(event: &str) {
     use std::io::Write;
-    let msg = "\x07\x1b]9;Claude Code \u{2014} done\x07";
+    let what = if event == "question" {
+        "waiting for you"
+    } else {
+        "done"
+    };
+    let msg = format!("\x07\x1b]9;Claude Code \u{2014} {}\x07", what);
     if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
         let _ = tty.write_all(msg.as_bytes());
         let _ = tty.flush();
@@ -295,9 +592,22 @@ fn bell() {
     }
 }
 
-/// Daemon: accept one-line "play\t<sound>\t<vol>" requests on 127.0.0.1:port and
+/// What the daemon plays for a network request: the event name is looked up in
+/// *this* machine's config, so a remote box gets your `completed` / `question`
+/// sounds but can never name a file here. Anything that isn't an event name
+/// (an older client sent the sound name; a stranger might send a path) plays
+/// the built-in voice, as before.
+fn remote_sound_for(event: &str, cfg: &Cfg) -> String {
+    match event {
+        "completed" => cfg.completed.clone(),
+        "question" => cfg.question.clone(),
+        _ => "claude".to_string(),
+    }
+}
+
+/// Daemon: accept one-line "play\t<event>\t<vol>" requests on 127.0.0.1:port and
 /// play them locally. Runs on the machine with speakers (see install-daemon).
-/// Network-sourced requests only ever play the built-in voice, never a path.
+/// The config is re-read per request, so edits apply without a restart.
 fn listen(port: u16) {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
@@ -318,7 +628,7 @@ fn listen(port: u16) {
                 let p: Vec<&str> = line.trim().split('\t').collect();
                 if p.len() >= 3 && p[0] == "play" {
                     let vol: f32 = p[2].parse::<f32>().unwrap_or(2.0).clamp(0.0, 4.0);
-                    play_sound("claude", vol);
+                    play_sound(&remote_sound_for(p[1], &read_cfg()), vol);
                 }
             }
         });
@@ -376,10 +686,12 @@ fn install_daemon(port: u16) {
     let dir = home().join(".config").join("systemd").join("user");
     let _ = fs::create_dir_all(&dir);
     let unit = dir.join("claude-notify.service");
+    // No After=default.target: a unit that default.target Wants must not also
+    // order itself after default.target, or systemd reports an ordering cycle
+    // and may drop the service from the login transaction.
     let body = format!(
         "[Unit]\n\
-Description=claude-notify local playback daemon\n\
-After=default.target\n\n\
+Description=claude-notify local playback daemon\n\n\
 [Service]\n\
 ExecStart={} listen --port {}\n\
 Restart=always\n\
@@ -808,9 +1120,13 @@ fn main() {
         _ => {}
     }
 
+    // the hook payload: Claude Code always pipes JSON in; someone typing
+    // `claude-notify play` at a terminal has nothing to pipe, so don't wait on a TTY
     let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let sid = extract_str(&input, "session_id").unwrap_or_else(|| "anon".to_string());
+    if !stdin_is_tty() {
+        let _ = std::io::stdin().read_to_string(&mut input);
+    }
+    let sid = session_id(&input).unwrap_or_else(|| "anon".to_string());
 
     match mode {
         "mark" => write_marker(&sid),
@@ -836,9 +1152,9 @@ fn main() {
             if remote.is_empty() {
                 play_sound(&sound, vol); // local machine with speakers
             } else if remote == "bell" {
-                bell(); // terminal signal only
-            } else if !send_remote(&remote, &sound, vol) {
-                bell(); // tunnel/daemon unreachable -> fall back to the bell
+                bell(&event); // terminal signal only
+            } else if !send_remote(&remote, &event, vol) {
+                bell(&event); // tunnel/daemon unreachable -> fall back to the bell
             }
         }
         _ => eprintln!(
@@ -920,18 +1236,52 @@ mod tests {
     }
 
     #[test]
-    fn extract_num_reads_vol() {
-        assert_eq!(extract_num(r#"{"vol": 1.5}"#, "vol"), Some(1.5));
-        assert_eq!(extract_num(r#"{"vol":2}"#, "vol"), Some(2.0));
-        assert_eq!(extract_num(r#"{"x":1}"#, "vol"), None);
+    fn cfg_parses_escaped_paths_and_numbers() {
+        // a Windows path can only be written with doubled backslashes in JSON
+        let c = cfg_from_json(
+            r#"{ "vol": 1.5, "completed": "C:\\Users\\me\\ding.wav", "question": "/tmp/q.wav", "remote": "127.0.0.1:47291" }"#,
+        );
+        assert_eq!(c.vol, 1.5);
+        assert_eq!(c.completed, r"C:\Users\me\ding.wav");
+        assert_eq!(c.question, "/tmp/q.wav");
+        assert_eq!(c.remote, "127.0.0.1:47291");
+        // an integer volume, missing keys keep their defaults
+        let d = cfg_from_json(r#"{"vol":2}"#);
+        assert_eq!(d.vol, 2.0);
+        assert_eq!(d.completed, "claude");
+        assert_eq!(d.remote, "");
+        // a wrong type is ignored, not fatal
+        assert_eq!(cfg_from_json(r#"{"vol":"loud"}"#).vol, 2.0);
+        // garbage keeps every default
+        let e = cfg_from_json("not json");
+        assert_eq!(e.vol, 2.0);
+        assert_eq!(e.question, "claude");
     }
 
     #[test]
-    fn extract_reads_session_and_remote() {
-        let j = r#"{"session_id":"abc-123","remote":"127.0.0.1:47291"}"#;
-        assert_eq!(extract_str(j, "session_id").as_deref(), Some("abc-123"));
-        assert_eq!(extract_str(j, "remote").as_deref(), Some("127.0.0.1:47291"));
-        assert_eq!(extract_str(j, "missing"), None);
+    fn session_id_comes_from_the_real_key() {
+        // a prompt that quotes the key must not be mistaken for it
+        let j = r#"{"prompt":"what does \"session_id\": \"fake\" mean?","session_id":"abc-123","hook_event_name":"UserPromptSubmit"}"#;
+        assert_eq!(session_id(j).as_deref(), Some("abc-123"));
+        assert_eq!(session_id(r#"{"cwd":"/x"}"#), None);
+        assert_eq!(session_id(""), None);
+        assert_eq!(session_id("{}"), None);
+    }
+
+    #[test]
+    fn remote_requests_map_events_through_local_config() {
+        let cfg = Cfg {
+            vol: 2.0,
+            completed: "/done.wav".to_string(),
+            question: "/q.wav".to_string(),
+            remote: String::new(),
+        };
+        assert_eq!(remote_sound_for("completed", &cfg), "/done.wav");
+        assert_eq!(remote_sound_for("question", &cfg), "/q.wav");
+        // an older client sent a sound name; a stranger might send a path:
+        // both get the built-in voice, never a file of this machine's choosing
+        assert_eq!(remote_sound_for("claude", &cfg), "claude");
+        assert_eq!(remote_sound_for("/etc/passwd", &cfg), "claude");
     }
 
     #[test]
@@ -943,7 +1293,29 @@ mod tests {
     }
 
     #[test]
+    fn prune_removes_only_stale_json_markers() {
+        let dir = std::env::temp_dir().join(format!("cn-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("stale.json");
+        let fresh = dir.join("fresh.json");
+        let other = dir.join("not-ours.txt");
+        for p in [&stale, &fresh, &other] {
+            fs::write(p, "{\"t\":1}").unwrap();
+        }
+        let long_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        for p in [&stale, &other] {
+            fs::File::options().write(true).open(p).unwrap().set_modified(long_ago).unwrap();
+        }
+        prune_old_markers(&dir, Duration::from_secs(7 * 86_400));
+        assert!(!stale.exists(), "stale marker should be gone");
+        assert!(fresh.exists(), "fresh marker must survive");
+        assert!(other.exists(), "only .json markers are ours to delete");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn send_remote_unreachable_is_false_fast() {
-        assert!(!send_remote("127.0.0.1:1", "claude", 2.0));
+        assert!(!send_remote("127.0.0.1:1", "completed", 2.0));
     }
 }

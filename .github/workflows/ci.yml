@@ -1,6 +1,9 @@
 # Build + unit-test both tools on every OS the installers target, then run the
 # status line once per glyph mode on a sample payload and check the invariants
-# the README promises (pure ASCII in --ascii, a fixed-width line across frames).
+# the README promises (pure ASCII in --ascii, a fixed-width line across frames,
+# the context gauge surviving a bogus payload field). Two more jobs run each
+# installer against a scratch home directory, twice, from the checked-out
+# sources, and check what it did to settings.json.
 name: ci
 on:
   push:
@@ -70,3 +73,123 @@ jobs:
           # COLUMNS alone (what Claude Code sets) fits too, keeping a 2-column margin
           out=$(payload 11 136779 5.37 | COLUMNS=120 ./statusline-rs --ascii | strip | head -1)
           [ "$(printf '%s' "$out" | awk '{ print length($0) }')" -le 118 ] || { echo "COLUMNS=120 not honoured: $out"; exit 1; }
+          # an out-of-range total_input_tokens falls through to current_usage instead of blanking the gauge
+          out=$(printf '{"model":{"display_name":"Opus 4.8 (1M context)"},"context_window":{"context_window_size":1000000,"total_input_tokens":4457100,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":8000,"cache_read_input_tokens":112000}}}' | ./statusline-rs --ascii --width 0 | strip)
+          echo "$out" | grep -q '120.0K/1M' || { echo "context fallback failed: $out"; exit 1; }
+
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        tool: [python3, node]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install into a scratch HOME, twice (${{ matrix.tool }} patches settings.json)
+        shell: bash
+        env:
+          CCA_LOCAL_SRC: ${{ github.workspace }}
+          CCA_NO_DAEMON: "1"
+          CCA_JSON_TOOL: ${{ matrix.tool }}
+        run: |
+          # rustup finds its toolchains through HOME unless told otherwise: pin them
+          # to the runner's real ones before pointing HOME at the scratch directory
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export HOME="$(mktemp -d)"
+          mkdir -p "$HOME/.claude"
+          # an existing settings.json: another Stop hook and a non-ASCII value must survive
+          cat > "$HOME/.claude/settings.json" <<'EOF'
+          {
+            "model": "opus",
+            "env": { "GREETING": "안녕" },
+            "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "echo mine" } ] } ] }
+          }
+          EOF
+          cp "$HOME/.claude/settings.json" original.json
+
+          sh install.sh | tee first.log
+          grep -q 'ok (backup:' first.log
+          python3 - "$HOME/.claude/settings.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert d["model"] == "opus", d
+          assert d["env"]["GREETING"] == "안녕", d
+          assert d["statusLine"]["command"].endswith("/.claude/statusline-rs"), d["statusLine"]
+          assert d["statusLine"]["refreshInterval"] == 1, d["statusLine"]
+          h = d["hooks"]
+          cmds = {ev: [x["command"] for g in h[ev] for x in g["hooks"]] for ev in h}
+          assert cmds["Stop"][0] == "echo mine", cmds
+          assert any(c.endswith("claude-notify play --event completed --threshold 60") for c in cmds["Stop"]), cmds
+          assert any(c.endswith("claude-notify mark") for c in cmds["UserPromptSubmit"]), cmds
+          assert h["PreToolUse"][0]["matcher"] == "AskUserQuestion", h
+          assert h["Notification"][0]["matcher"] == "permission_prompt", h
+          assert cmds["Notification"][0].endswith("claude-notify play --event question"), cmds
+          assert sum(len(v) for v in cmds.values()) == 5, cmds
+          print("settings.json ok")
+          PY
+          # non-ASCII stayed as typed, not \uXXXX-escaped
+          grep -q '안녕' "$HOME/.claude/settings.json" || { echo "non-ASCII was escaped"; exit 1; }
+          # the backup is the file exactly as it was before the install
+          cmp original.json "$HOME/.claude/settings.json.bak"
+          cp "$HOME/.claude/settings.json" first.json
+
+          # second run: nothing changes, and the backup is still the original
+          sh install.sh | tee second.log
+          grep -q 'already up to date' second.log
+          cmp first.json "$HOME/.claude/settings.json"
+          cmp original.json "$HOME/.claude/settings.json.bak"
+
+          # the binaries, config and sources landed
+          test -x "$HOME/.claude/statusline-rs" && test -x "$HOME/.claude/claude-notify"
+          "$HOME/.claude/claude-notify" --version
+          echo '{}' | "$HOME/.claude/statusline-rs" >/dev/null
+          test -f "$HOME/.claude/.claude-notify.json" && cat "$HOME/.claude/.claude-notify.json"
+          ls "$HOME/.claude"
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install into a scratch profile, twice
+        shell: pwsh
+        env:
+          CCA_LOCAL_SRC: ${{ github.workspace }}
+          CCA_NO_DAEMON: "1"
+        run: |
+          # rustup finds its toolchains through USERPROFILE unless told otherwise: pin
+          # them to the runner's real ones before pointing USERPROFILE at a scratch dir
+          if (-not $env:RUSTUP_HOME) { $env:RUSTUP_HOME = Join-Path $env:USERPROFILE '.rustup' }
+          if (-not $env:CARGO_HOME)  { $env:CARGO_HOME  = Join-Path $env:USERPROFILE '.cargo' }
+          $env:USERPROFILE = Join-Path $env:RUNNER_TEMP ('cca-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.claude') | Out-Null
+          $settings = Join-Path $env:USERPROFILE '.claude\settings.json'
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          # an existing settings.json: another Stop hook and a non-ASCII value must survive
+          $orig = "{`n  `"model`": `"opus`",`n  `"env`": { `"GREETING`": `"안녕`" },`n  `"hooks`": { `"Stop`": [ { `"hooks`": [ { `"type`": `"command`", `"command`": `"echo mine`" } ] } ] }`n}`n"
+          [IO.File]::WriteAllText($settings, $orig, $utf8)
+
+          $log = (& .\install.ps1 | Out-String)
+          Write-Host $log
+          if ($log -match '(?m)^error:' -or $log -match 'FAILED') { throw 'first install reported a problem' }
+          $d = [IO.File]::ReadAllText($settings) | ConvertFrom-Json
+          if ($d.model -ne 'opus') { throw "model lost: $($d.model)" }
+          if ($d.env.GREETING -ne '안녕') { throw 'non-ASCII value changed' }
+          if ($d.statusLine.command -notmatch '^"[A-Za-z]:/.*/\.claude/statusline-rs\.exe"$') { throw "statusLine command: $($d.statusLine.command)" }
+          if (@($d.hooks.Stop).Count -ne 2 -or $d.hooks.Stop[0].hooks[0].command -ne 'echo mine') { throw 'Stop hooks changed' }
+          if ($d.hooks.Stop[1].hooks[0].command -notmatch 'claude-notify\.exe" play --event completed --threshold 60$') { throw "Stop hook: $($d.hooks.Stop[1].hooks[0].command)" }
+          if ($d.hooks.UserPromptSubmit[0].hooks[0].command -notmatch 'claude-notify\.exe" mark$') { throw 'UserPromptSubmit hook' }
+          if ($d.hooks.PreToolUse[0].matcher -ne 'AskUserQuestion') { throw 'PreToolUse matcher' }
+          if ($d.hooks.Notification[0].matcher -ne 'permission_prompt') { throw 'Notification matcher' }
+          if ([IO.File]::ReadAllText("$settings.bak") -ne $orig) { throw 'backup is not the original file' }
+          $first = [IO.File]::ReadAllText($settings)
+
+          $log = (& .\install.ps1 | Out-String)
+          Write-Host $log
+          if ($log -match '(?m)^error:' -or $log -match 'FAILED') { throw 'second install reported a problem' }
+          if ($log -notmatch 'already up to date') { throw 'second run rewrote settings.json' }
+          if ([IO.File]::ReadAllText($settings) -ne $first) { throw 'second run changed settings.json' }
+          if ([IO.File]::ReadAllText("$settings.bak") -ne $orig) { throw 'second run replaced the backup' }
+          Get-ChildItem (Join-Path $env:USERPROFILE '.claude')
